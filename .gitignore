@@ -1,0 +1,35 @@
+# ── Binaries & build artifacts ───────────────────────────────
+/build*/
+/simplechess*
+*.o
+*.d
+compile_commands.json
+
+# ── Not part of the engine: training, trainer dep, data, archives ──
+/data/
+/train/
+/train_bullet/
+/external/bullet/
+/versions/
+/books/
+/staging-v3/
+
+# ── Tooling: ship only the PGO build script ──────────────────
+/tools/*
+!/tools/pgo_workload.py
+
+# ── Branding: ship the finished logo assets (not the raw renders) ──
+/assets/*
+!/assets/simplechess.png
+!/assets/simplechess.ico
+!/assets/simplechess-100x50.bmp
+!/assets/simplechess-130x65.bmp
+
+# ── Editor / OS / Python cruft ───────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.claude/
+*.pgn
