@@ -39,7 +39,6 @@ UCI::UCI(std::filesystem::path exe_dir) : search_(tt_), exe_dir_(std::move(exe_d
     eval::init();
     tt_.resize(hash_mb_);
     board_ = Board(chess::constants::STARTPOS);
-    try_load_default_book();
     try_load_default_net();
 }
 
@@ -119,19 +118,6 @@ void UCI::try_load_default_net() {
               << ") — running hand-crafted eval" << std::endl;
 }
 
-void UCI::try_load_default_book() {
-    const std::filesystem::path candidates[] = {
-        exe_dir_ / "books" / "book.bin",
-        exe_dir_ / "book.bin",
-        std::filesystem::path("books") / "book.bin",
-        std::filesystem::path("book.bin"),
-    };
-    for (const auto& candidate : candidates) {
-        if (book_.load(candidate)) return;
-    }
-    // No book at any default location: play normally, without comment — this
-    // is a fully supported configuration, not an error.
-}
 
 void UCI::handle_uci() const {
     std::cout << "id name " << kEngineName << '\n';
@@ -145,8 +131,8 @@ void UCI::handle_uci() const {
     std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
     std::cout << "option name Ponder type check default false\n";
     std::cout << "option name Clear Hash type button\n";
-    std::cout << "option name OwnBook type check default true\n";
-    std::cout << "option name Book File type string default books/book.bin\n";
+    std::cout << "option name OwnBook type check default false\n";
+    std::cout << "option name Book File type string default <empty>\n";
     std::cout << "option name EvalFile type string default " << kDefaultNetName << "\n";
     std::cout << "option name MaterialBlend type spin default 0 min 0 max 200\n";
     std::cout << "option name NNUEWeight type spin default 100 min 0 max 100\n";

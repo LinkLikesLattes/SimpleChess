@@ -24,7 +24,7 @@ a C++20 compiler.
   killer / history / continuation move ordering, and lazy-SMP multithreading.
 - **UCI** — speaks the UCI protocol; drop it into any UCI GUI (Cute Chess,
   BanksiaGUI, En Croissant, Arena).
-- Optional Polyglot opening book.
+- Optional Polyglot opening book support — off by default; no book ships, bring your own.
 
 ## Build
 
@@ -73,8 +73,8 @@ box. Point the `EvalFile` option at another file to use a different network.
 | `Threads` | 8 | search threads (lazy SMP) |
 | `Move Overhead` | 30 | ms reserved for GUI / network lag |
 | `Ponder` | false | think on the opponent's clock |
-| `OwnBook` | true | play from a Polyglot book when one is present |
-| `Book File` | books/book.bin | path to the Polyglot book |
+| `OwnBook` | false | opt in to a Polyglot book (none ships) |
+| `Book File` | *(none)* | path to a Polyglot book, if you supply one |
 | `EvalFile` | nets/SCNNUEv2-5.scn5 | network file to load |
 | `RootNoise` | 0 | root-move score jitter (cp) for varied play |
 | `NNUEWeight` / `NNUEScale` / `MaterialBlend` | 100 / 100 / 0 | advanced evaluation-blend knobs |

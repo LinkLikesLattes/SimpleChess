@@ -43,10 +43,6 @@ class UCI {
     void handle_gengame(std::istringstream& is);  // in-engine self-play game generation
     void handle_print() const;
 
-    // Look for a book at, in order: <exe_dir>/books/book.bin, <exe_dir>/book.bin,
-    // ./books/book.bin, ./book.bin. Leaves the book unloaded (silently — no
-    // book is a normal, supported state) if none of those exist.
-    void try_load_default_book();
     void try_load_default_net();
 
     TranspositionTable tt_;
@@ -60,7 +56,7 @@ class UCI {
     int         threads_       = SC_DEFAULT_THREADS;  // "Threads" — Lazy SMP worker count
     int         move_overhead_ = 30;    // "Move Overhead", in ms
     bool        ponder_        = false; // "Ponder"
-    bool        own_book_      = true;  // "OwnBook" — use the opening book when loaded
+    bool        own_book_      = false; // "OwnBook" — opt-in; no book ships or loads by default
 };
 
 }  // namespace engine
