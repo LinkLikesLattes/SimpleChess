@@ -43,12 +43,13 @@ BUILD_DATE   := $(shell date +%Y-%m-%d)
 # leaves exactly one dot in the file, so ".scn" is unambiguously the extension
 # no matter how a tool splits it. Derived from VERSION, never written by hand.
 VERSION_FS   := $(subst .,-,$(VERSION))
-# NNUE nets track MAJOR.MINOR only: a patch/hotfix bump (1.9 -> 1.9.1) does not
-# change the net, so the default net name must drop the patch component and both
-# 1.9 and 1.9.8 look for SCNNUEv1-9.scn3. Take the first two dot-separated fields.
-NET_VERSION_FS := $(word 1,$(subst ., ,$(VERSION)))-$(word 2,$(subst ., ,$(VERSION)))
+# NNUE nets are keyed by MAJOR only (SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5): a MAJOR bump
+# is an architecture/format change, while retraining does NOT bump the version, so a
+# MAJOR owns many dated nets and the engine discovers the newest one at startup
+# (src/uci.cpp). The build only needs the MAJOR; the date lives in the filename.
+NET_MAJOR := $(word 1,$(subst ., ,$(VERSION)))
 VERSION_DEFS := -DSC_VERSION='"$(VERSION)"' -DSC_VERSION_FS='"$(VERSION_FS)"' \
-                -DSC_NET_VERSION_FS='"$(NET_VERSION_FS)"' \
+                -DSC_NET_MAJOR=$(NET_MAJOR) \
                 -DSC_BUILD_DATE='"$(BUILD_DATE)"'
 
 # Apple Silicon: -mcpu=native lets clang target this exact core (M1/M2/M3/M4).
@@ -98,7 +99,7 @@ run: all
 # instrument -> run workload -> rebuild with -fprofile-use). Measured at or above
 # the plain LTO build, so it's the kept build for the engine. Provide a net so the
 # NNUE paths get profiled; weights don't matter, only executed code paths.
-#   make profile-build PGO_NET=nets/SCNNUEv2-5.scn5
+#   make profile-build PGO_NET=nets/SCNNUEv3-2026-08-30.scn5
 LLVM_PROFDATA ?= $(shell xcrun --find llvm-profdata 2>/dev/null || echo llvm-profdata)
 # Sibling of BUILD_DIR (NOT nested) so the phase-3 "rm -rf BUILD_DIR" cannot wipe
 # the profile we just merged.

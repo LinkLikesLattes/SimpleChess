@@ -4,6 +4,24 @@ Release history for Simple Chess. An entry is added here whenever a tested candi
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.0.0 — 2026-08-30
+
+- Self-reports: `SimpleChess 3.0.0`
+- Source VERSION at save time: `3.0.0`
+
+NNUE-only relabel and rewiring. The 2.5 architecture (FullThreats+PP_3Wide, HL 512,
+SCN5 int8) was a major-class, format-incompatible change; 3.0.0 makes the line honest
+and finishes the transition. Hand-crafted eval fully removed (evaluate.cpp/.hpp gone,
+with the MaterialBlend/NNUEWeight/NNUEScale blend knobs): the engine requires its
+network and exits with an error if none can be loaded. Nets are now date-keyed —
+`SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5` (year-month-day so names sort chronologically);
+discovery loads the newest own-major net, falling back to the newest lower-major net.
+New net SCNNUEv3-2026-08-30 trained on an 879,778,971-position pool: the v2-5 + v2-6
+self-play runs combined through the new dedup-combine (one row per unique position,
+newest generation's label wins), shuffled on disk. Search is behavior-identical to
+2.5 at shipping defaults (verified: same bestmove/score/nodes on a fixed-depth suite
+with the same net). PGO build.
+
 ## v2.5 — 2026-08-23
 
 - Self-reports: `SimpleChess NNUE 2.5`

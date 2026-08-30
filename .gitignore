@@ -5,6 +5,9 @@
 *.d
 compile_commands.json
 
+# ── Nets: ship only the quantised playing net, never the float export ──
+/nets/*.scn4
+
 # ── Not part of the engine: training, trainer dep, data, archives ──
 /data/
 /train/
@@ -33,3 +36,6 @@ __pycache__/
 *.pyc
 .claude/
 *.pgn
+
+# ── Private local dev notes (never shipped) ──────────────────
+/DEV_TODO.md

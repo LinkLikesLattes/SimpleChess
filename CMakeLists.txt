@@ -28,8 +28,10 @@ add_executable(simplechess ${SOURCES})
 # UCI `id name`.
 file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" SC_VERSION LIMIT_COUNT 1)
 string(TIMESTAMP SC_BUILD_DATE "%Y-%m-%d")
+string(REGEX MATCH "^[0-9]+" SC_NET_MAJOR "${SC_VERSION}")  # engine MAJOR (net-compat key)
 target_compile_definitions(simplechess PRIVATE
     "SC_VERSION=\"${SC_VERSION}\""
+    "SC_NET_MAJOR=${SC_NET_MAJOR}"
     "SC_BUILD_DATE=\"${SC_BUILD_DATE}\""
 )
 

@@ -40,7 +40,7 @@ make clean
 For the fastest (shipping) binary, use the profile-guided build:
 
 ```sh
-make profile-build PGO_NET=nets/SCNNUEv2-5.scn5
+make profile-build PGO_NET=nets/SCNNUEv3-2026-08-30.scn5
 ```
 
 The release build uses `-O3 -flto -mcpu=native`; retarget the architecture with,
@@ -61,9 +61,11 @@ position startpos
 go depth 12
 ```
 
-The network is loaded automatically from `nets/SCNNUEv2-5.scn5` (next to the
-binary or under `nets/`) — it ships in the repo, so the engine runs out of the
-box. Point the `EvalFile` option at another file to use a different network.
+The network is discovered automatically at startup: the engine loads the newest
+`SCNNUEv3-<YYYY-MM-DD>.scn5` found next to the binary or under `nets/` — the
+current net ships in the repo, so the engine runs out of the box. There is no
+fallback evaluation: if no network can be loaded the engine exits with an error.
+Point the `EvalFile` option at another file to use a different network.
 
 ## UCI options
 
@@ -75,15 +77,17 @@ box. Point the `EvalFile` option at another file to use a different network.
 | `Ponder` | false | think on the opponent's clock |
 | `OwnBook` | false | opt in to a Polyglot book (none ships) |
 | `Book File` | *(none)* | path to a Polyglot book, if you supply one |
-| `EvalFile` | nets/SCNNUEv2-5.scn5 | network file to load |
+| `EvalFile` | *(newest `SCNNUEv3-<date>.scn5`)* | network file to load |
 | `RootNoise` | 0 | root-move score jitter (cp) for varied play |
-| `NNUEWeight` / `NNUEScale` / `MaterialBlend` | 100 / 100 / 0 | advanced evaluation-blend knobs |
 
 ## The network
 
-`nets/SCNNUEv2-5.scn5` is the pre-quantized int8 playing network (file magic
-`SCN5`), committed to the repo so the engine works immediately after a clone or
-"Download ZIP." It is trained from the engine's own self-play; the trainer and
+`nets/SCNNUEv3-2026-08-30.scn5` is the pre-quantized int8 playing network (file
+magic `SCN5`), committed to the repo so the engine works immediately after a
+clone or "Download ZIP." Nets are named `SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5`
+(engine major + export date) and the engine loads the newest one it finds; the
+repo always ships only the latest network — older nets are available from older
+releases. It is trained from the engine's own self-play; the trainer and
 training data are developed separately and are not part of this repository.
 
 ## License

@@ -21,8 +21,10 @@
 
 namespace engine::nnue {
 
-// Load a .scn network from disk. Returns true on success; on failure the engine
-// keeps whatever eval it had (HCE) and this returns false.
+// Load a .scn5 network from disk. Returns true on success and false on failure.
+// On failure the engine keeps the previously loaded net, if any. There is no
+// hand-crafted-eval fallback in 3.0.0: startup aborts if no net can be loaded at
+// all, so once running, a net is always present.
 bool load(const std::string& path);
 
 // True once a network is loaded and evaluate() will use it.

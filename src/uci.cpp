@@ -9,46 +9,51 @@
 #include "uci.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <system_error>
 #include <vector>
 
-#include "evaluate.hpp"
 #include "nnue.hpp"
 
 namespace engine {
 
-// Default network filename looked for next to the binary / in nets/ at startup.
-// THREATS FORK: this engine plays with a *threats* net (FullThreats+PP_3Wide),
-// whose quantised SIMD playing format is ".scn5" (int8 feature transformer, magic
-// "SCN5") -- NOT the stock ".scn3" (HalfKA-only, magic "SCN3", which nnue::load()
-// here rejects). So the default extension is ".scn5".
-// Naming convention: SCNNUEv<MAJOR-MINOR>.scn5 with the dot replaced by a hyphen
-// (2.5 -> SCNNUEv2-5.scn5), so the filename holds exactly one dot and ".scn5" is
-// unambiguously the extension however a tool splits it.
-// The net tracks MAJOR.MINOR only, NOT the patch: a hotfix bump (2.5 -> 2.5.1)
-// leaves the net unchanged, so SC_NET_VERSION_FS drops the patch and both 2.5 and
-// 2.5.8 resolve to SCNNUEv2-5.scn5. SC_NET_VERSION_FS is derived from the VERSION
-// file by the Makefile; point EvalFile at a net explicitly to use any other (e.g.
-// the float ".scn4" straight from the threats trainer).
-static constexpr const char* kDefaultNetName = "SCNNUEv" SC_NET_VERSION_FS ".scn5";
+// Networks live next to the binary / in nets/ and are named
+//   SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5
+// (engine MAJOR + export/quant date, year-month-day so names sort
+// chronologically). This engine plays a *threats* net (FullThreats+PP_3Wide)
+// whose quantised SIMD format is ".scn5" (int8 feature transformer, magic
+// "SCN5") -- NOT the stock ".scn3" (magic "SCN3", which nnue::load() rejects).
+//
+// MAJOR encodes format compatibility (a MAJOR bump is an architecture/format
+// change); retraining a net does NOT bump the version, so within a MAJOR nets
+// are distinguished by DATE, not a minor. Discovery loads the newest net of
+// THIS engine's MAJOR; if none exists yet it falls back to the newest net of a
+// LOWER major (e.g. the pre-3.0 "SCNNUEv2-5.scn5", which is the same SCN5
+// architecture), and only if NOTHING loads it aborts -- there is no
+// hand-crafted-eval fallback (removed in 3.0.0): a netless engine is not this
+// engine. Point EvalFile at a file to use any other net explicitly (e.g. a
+// float ".scn4").
+static constexpr int kNetMajor = SC_NET_MAJOR;
 
 UCI::UCI(std::filesystem::path exe_dir) : search_(tt_), exe_dir_(std::move(exe_dir)) {
-    eval::init();
     tt_.resize(hash_mb_);
     board_ = Board(chess::constants::STARTPOS);
     try_load_default_net();
 }
 
-// Parse the version out of a net filename ("SCNNUEv1-3.scn3" -> {1,3}). Returns
-// an empty vector if the name doesn't follow the convention. Comparing the
-// vectors numerically orders 0-10 *after* 0-2, which lexicographic sorting of
-// filenames would get backwards.
+// Parse the {major, ...} version vector out of a net filename. Accepts the dated
+// form "SCNNUEv3-2026-08-30.scn5" -> {3, 2026, 8, 30} and the legacy form
+// "SCNNUEv2-5.scn5" -> {2, 5}. Returns {} if the name isn't our convention.
+// The date is YEAR-MONTH-DAY, so the fields land in the vector already in
+// chronological significance order and "newest" is a straight std::vector<int>
+// max — no reordering. A dated net's year (>=2026) always outranks a legacy
+// minor within the same major, so a dated net supersedes a same-major legacy net.
 static std::vector<int> net_version_of(const std::string& filename) {
     static constexpr const char* kPrefix = "SCNNUEv";
-    static constexpr const char* kSuffix = ".scn5";  // threats playing format (see kDefaultNetName)
+    static constexpr const char* kSuffix = ".scn5";  // threats playing format (int8 SCN5; see header note)
     const std::size_t plen = std::char_traits<char>::length(kPrefix);
     const std::size_t slen = std::char_traits<char>::length(kSuffix);
     if (filename.size() <= plen + slen) return {};
@@ -77,45 +82,51 @@ void UCI::try_load_default_net() {
         exe_dir_ / "nets", exe_dir_, std::filesystem::path("nets"), std::filesystem::path("."),
     };
 
-    // 1. The net matching this exact engine version.
-    for (const auto& dir : dirs) {
-        if (nnue::load((dir / kDefaultNetName).string())) {
-            std::cout << "info string NNUE loaded: " << (dir / kDefaultNetName).string()
-                      << std::endl;
-            return;
-        }
-    }
-
-    // 2. No exact match. VERSION is bumped at the START of a development cycle,
-    //    so the matching net routinely doesn't exist yet — fall back to the
-    //    newest net that does, and SAY SO. Silence here used to mean a version
-    //    bump quietly downgraded the engine to HCE, which is invisible except
-    //    in `eval` output and silently corrupts any data generated with it.
-    std::filesystem::path  best;
-    std::vector<int>       best_ver;
+    // Scan every recognised net once, tracking two candidates:
+    //   best_own -- newest net whose MAJOR == this engine's MAJOR (the preferred net)
+    //   best_low -- newest net whose MAJOR <  this engine's MAJOR (transition fallback)
+    // "Newest" is the numeric version vector (see net_version_of). A HIGHER major is
+    // never chosen: it may be a future, format-incompatible net this build predates.
+    std::filesystem::path best_own, best_low;
+    std::vector<int>      ver_own, ver_low;
     for (const auto& dir : dirs) {
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
             if (ec) break;
             const std::vector<int> ver = net_version_of(entry.path().filename().string());
             if (ver.empty()) continue;
-            if (best_ver.empty() || ver > best_ver) {
-                best_ver = ver;
-                best     = entry.path();
+            const int major = ver[0];
+            if (major == kNetMajor) {
+                if (ver_own.empty() || ver > ver_own) { ver_own = ver; best_own = entry.path(); }
+            } else if (major < kNetMajor) {
+                if (ver_low.empty() || ver > ver_low) { ver_low = ver; best_low = entry.path(); }
             }
         }
     }
-    if (!best.empty() && nnue::load(best.string())) {
-        std::cout << "info string NNUE loaded: " << best.string() << "  (expected "
-                  << kDefaultNetName << " for version " << SC_VERSION
-                  << "; using newest available)" << std::endl;
+
+    // 1. Preferred: the newest net of this engine's own major.
+    if (!best_own.empty() && nnue::load(best_own.string())) {
+        std::cout << "info string NNUE loaded: " << best_own.string() << std::endl;
         return;
     }
 
-    // 3. Nothing at all. HCE is a supported configuration, but it is a
-    //    different engine — never let that be inferred rather than stated.
-    std::cout << "info string WARNING: no NNUE net found (looked for " << kDefaultNetName
-              << ") — running hand-crafted eval" << std::endl;
+    // 2. Transition fallback: no own-major net yet -> load the newest LOWER-major
+    //    net (e.g. the pre-3.0 "SCNNUEv2-5.scn5", same SCN5 architecture) and SAY SO.
+    if (!best_low.empty() && nnue::load(best_low.string())) {
+        std::cout << "info string NNUE loaded: " << best_low.string()
+                  << "  (no SCNNUEv" << kNetMajor << "-<date>.scn5 found for version "
+                  << SC_VERSION << "; using newest available)" << std::endl;
+        return;
+    }
+
+    // 3. Nothing loaded. There is NO hand-crafted-eval fallback in 3.0.0: a netless
+    //    engine is a different, weaker program and every tool here depends on the
+    //    net. Fail loudly instead of silently playing without it.
+    std::cerr << "FATAL: no NNUE net could be loaded (looked for SCNNUEv" << kNetMajor
+              << "-<YYYY-MM-DD>.scn5 in nets/ and beside the binary). This engine does "
+                 "not run without its network -- place a net there or point EvalFile at one."
+              << std::endl;
+    std::exit(1);
 }
 
 
@@ -133,10 +144,8 @@ void UCI::handle_uci() const {
     std::cout << "option name Clear Hash type button\n";
     std::cout << "option name OwnBook type check default false\n";
     std::cout << "option name Book File type string default <empty>\n";
-    std::cout << "option name EvalFile type string default " << kDefaultNetName << "\n";
-    std::cout << "option name MaterialBlend type spin default 0 min 0 max 200\n";
-    std::cout << "option name NNUEWeight type spin default 100 min 0 max 100\n";
-    std::cout << "option name NNUEScale type spin default 100 min 0 max 100\n";
+    std::cout << "option name EvalFile type string default SCNNUEv"
+              << kNetMajor << "-<YYYY-MM-DD>.scn5\n";
     std::cout << "option name RootNoise type spin default 0 min 0 max 200\n";
     std::cout << "uciok" << std::endl;
 }
@@ -198,24 +207,13 @@ void UCI::handle_setoption(std::istringstream& is) {
         // (own_book_ then has nothing to serve) — no book is a normal state.
         book_.load(value);
     } else if (iequals(name, "EvalFile")) {
-        // Load an NNUE network on demand. Success switches eval to NNUE; failure
-        // leaves the current eval (HCE or a previously loaded net) untouched.
+        // Load an NNUE network on demand. Success switches to the new net; failure
+        // leaves the previously loaded net untouched. The engine always has a net
+        // (startup aborts if none can be loaded) and there is no HCE fallback.
         if (nnue::load(value))
             std::cout << "info string NNUE loaded: " << value << std::endl;
         else
             std::cout << "info string NNUE load FAILED: " << value << std::endl;
-    } else if (iequals(name, "MaterialBlend")) {
-        const int pct = std::clamp(std::stoi(value), 0, 200);
-        eval::set_material_blend(pct);
-        std::cout << "info string MaterialBlend = " << pct << "%" << std::endl;
-    } else if (iequals(name, "NNUEWeight")) {
-        const int pct = std::clamp(std::stoi(value), 0, 100);
-        eval::set_nnue_weight(pct);
-        std::cout << "info string NNUEWeight = " << pct << "%" << std::endl;
-    } else if (iequals(name, "NNUEScale")) {
-        const int pct = std::clamp(std::stoi(value), 0, 100);
-        eval::set_nnue_scale(pct);
-        std::cout << "info string NNUEScale = " << pct << "%" << std::endl;
     } else if (iequals(name, "RootNoise")) {
         const int cp = std::clamp(std::stoi(value), 0, 200);
         set_root_noise(cp);
@@ -395,8 +393,7 @@ void UCI::loop() {
         } else if (command == "eval") {
             // Debug convenience: static eval of the current position,
             // from the side to move's perspective.
-            std::cout << "static eval (stm pov): " << eval::evaluate(board_) << " cp"
-                      << "  [" << (nnue::loaded() ? "NNUE" : "HCE") << "]"
+            std::cout << "static eval (stm pov): " << nnue::evaluate(board_) << " cp"
                       << std::endl;
         } else if (command == "quit" || command == "exit") {
             search_.stop();

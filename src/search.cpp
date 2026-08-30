@@ -34,7 +34,6 @@
 #include <sstream>
 #include <thread>
 
-#include "evaluate.hpp"
 #include "movepick.hpp"
 #include "nnue.hpp"
 #include "see.hpp"
@@ -320,7 +319,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
         return VALUE_DRAW;
 
     const bool in_check = board.inCheck();
-    if (ss->ply >= MAX_PLY) return in_check ? VALUE_DRAW : eval::evaluate(board);
+    if (ss->ply >= MAX_PLY) return in_check ? VALUE_DRAW : nnue::evaluate(board);
 
     nodes_.fetch_add(1, std::memory_order_relaxed);
     seldepth_ = std::max(seldepth_, ss->ply);
@@ -349,7 +348,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     if (in_check) {
         best = -VALUE_INFINITE;
     } else {
-        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : eval::evaluate(board);
+        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : nnue::evaluate(board);
         best     = raw_eval;
         // A TT value with the right bound is a tighter estimate than raw eval.
         if (probe.hit && tt_value != VALUE_NONE && bound_covers(tt_bound, tt_value, best))
@@ -449,7 +448,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         // a genuine threefold (two prior occurrences) removes the phantom draw.
         if (board.isRepetition(2) || board.isHalfMoveDraw() || board.isInsufficientMaterial())
             return VALUE_DRAW;
-        if (ss->ply >= MAX_PLY) return board.inCheck() ? VALUE_DRAW : eval::evaluate(board);
+        if (ss->ply >= MAX_PLY) return board.inCheck() ? VALUE_DRAW : nnue::evaluate(board);
 
         // Mate distance pruning: the window can't contain mates longer than
         // one we've already proven from the root.
@@ -496,7 +495,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     Value raw_eval = VALUE_NONE;  // pure static eval — this is what goes into the TT
     Value eval     = VALUE_NONE;  // corrected + possibly TT-sharpened — drives pruning
     if (!in_check) {
-        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : eval::evaluate(board);
+        raw_eval = (probe.hit && tt_eval != VALUE_NONE) ? tt_eval : nnue::evaluate(board);
         // Fold in the learned per-pawn-structure correction. The corrected value
         // is what `improving` and the pruning heuristics see, and what the update
         // at the node's tail measures its residual against — a feedback loop that
