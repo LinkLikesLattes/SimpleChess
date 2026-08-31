@@ -23,6 +23,7 @@ compile_commands.json
 
 # ── Branding: ship the finished logo assets (not the raw renders) ──
 /assets/*
+!/assets/README.md
 !/assets/simplechess.png
 !/assets/simplechess.ico
 !/assets/simplechess-100x50.bmp

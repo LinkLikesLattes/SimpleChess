@@ -1,81 +1,43 @@
-# nets/ — networks, checkpoints, and the versioning convention
+# nets/ — the evaluation network
 
-This directory holds the NNUE evaluation networks and their training runs. The
-layout and naming are deliberately regular so a file always identifies itself.
+This directory holds the NNUE network the engine plays with. The repo always
+ships exactly **one** net — the current one. Older networks are available from
+older [releases](https://github.com/LinkLikesLattes/SimpleChess/releases); each
+release's source archive contains the net that version shipped with.
 
-## Layout
+## Naming: `SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5`
 
-```
-nets/
-├── SCNNUEv0-1.scn      deployed net for engine v0.1
-├── SCNNUEv0-2.scn      deployed net for engine v0.2
-├── v0-1/               v0.1's training run   (best.pt, last.pt, metrics.jsonl)
-├── v0-2/               v0.2's training run
-└── README.md           this file
-```
+Example: `SCNNUEv3-2026-08-30.scn5` — the network for the 3.x engine line,
+exported/quantized on 30 Aug 2026.
 
-- **Top level = deployed nets only**, one per engine version, named
-  `SCNNUEv<VERSION>.scn`. These are the float32 files the C++ engine loads.
-- **`v<VERSION>/` subdirs = training checkpoints** for that version: the PyTorch
-  `best.pt` / `last.pt` and the per-epoch `metrics.jsonl`. Never deployed
-  directly; `train/export.py` turns a `.pt` into the deployed `.scn`.
+- **`<MAJOR>`** is the engine's major version and encodes **format
+  compatibility**: a major bump means the network architecture or file format
+  changed and older/newer nets are not interchangeable across it.
+- **`<YYYY-MM-DD>`** is the export date, year-month-day **specifically so
+  filenames sort chronologically**. Retraining the network does *not* bump the
+  engine version — within a major, nets are distinguished by date alone.
 
-## Naming convention: `SCNNUEv<VERSION>.scn`
+## Discovery
 
-The version's dot is written as a **hyphen** (`0.1` → `SCNNUEv0-1.scn`) so the
-filename contains exactly one dot and `.scn` is unambiguously the extension, no
-matter how a tool splits the name.
+At startup the engine scans `nets/` (and the directory beside the binary) and
+loads, in order of preference:
 
-This name is **derived from the `VERSION` file, never hand-typed**:
-- The engine binary is compiled to look for `SCNNUEv<VERSION>.scn` beside it
-  (`src/uci.cpp` `kDefaultNetName`, built from the `SC_VERSION_FS` macro, which
-  the Makefile computes as `$(subst .,-,$(VERSION))`).
-- `train/train.py` defaults its checkpoint dir to `nets/v<VERSION>/` and prints
-  the exact `export.py` command with the right output name.
-- `tools/version.py` archives the net matching the current `VERSION` and records
-  its name + size + SHA-256 in the version's `meta.json`.
+1. the **newest net of its own major** (by date),
+2. else the newest net of a **lower** major (a transition fallback — it will say
+   so on stdout),
+3. else it **exits with an error**. There is no fallback evaluation; the engine
+   does not run without a network.
 
-Bumping `VERSION` therefore retargets everything at once. A bump made before its
-net is trained is safe: the engine loudly falls back to the newest net it can
-find (`info string NNUE loaded: ... (expected SCNNUEv0-3.scn ...)`) and warns if
-there is none — it never silently drops to HCE.
+A net of a *higher* major is never loaded — it may be format-incompatible with
+this build. To use a specific file regardless of discovery, set the UCI option
+`EvalFile` to its path.
 
-## A/B variants (testing two candidates for one version)
+## Format
 
-To compare two candidate nets for the same version — e.g. a net trained on a
-pooled dataset vs. one trained on only the newest batch — give each a **tag**:
+`.scn5` (file magic `SCN5`) is the pre-quantized int8 playing format: an int8
+feature transformer plus per-bucket layer weights, quantized once from the
+trainer's float export. The float intermediate (`.scn4`, magic `SCN4`) is a
+training artifact and is not shipped in the repo.
 
-```
-python3 train/train.py data/pool20m.bin  --lam 0.7 --tag pool   # -> nets/v0-3-pool/
-python3 train/train.py data/new10m.bin   --lam 0.7 --tag new    # -> nets/v0-3-new/
-python3 train/export.py nets/v0-3-pool/best.pt nets/SCNNUEv0-3-pool.scn
-python3 train/export.py nets/v0-3-new/best.pt  nets/SCNNUEv0-3-new.scn
-```
-
-Tagged nets are `SCNNUEv<VERSION>-<TAG>.scn` and coexist without touching the
-plain `SCNNUEv<VERSION>.scn`. To gauntlet them, each candidate is a self-contained
-(binary + net) pair in its own dir, with its tagged net linked under the base name
-the binary loads (`SCNNUEv<VERSION>.scn`) — see `test/` build dirs. The gauntlet
-winner is copied to the plain `SCNNUEv<VERSION>.scn`; that is the one that gets
-built into root and archived.
-
-## Full cycle for a new version N
-
-```
-echo N > VERSION                                     # e.g. 0.3
-# ... train self-play data (see train/selfplay.py) ...
-python3 train/train.py data/selfplay_10m.bin --lam 0.7   # -> nets/vN/best.pt
-python3 train/export.py nets/vN/best.pt nets/SCNNUEvN.scn
-make                                                 # root binary now loads it
-# ... gauntlet; if accepted: ...
-python3 tools/version.py save vN -m "..."            # archive binary+source+net
-python3 tools/version.py promote vN                  # install as live + CHANGELOG
-```
-
-## v0.1 is a legacy exception
-
-v0.1 was built before this convention. Its **archived** binary
-(`versions/v0.1/`) looks for `simplechessnnue.scn`, so that snapshot keeps its
-net under the old name (beside the binary, for the archive to run). The
-deployed copy in this directory follows the current convention
-(`SCNNUEv0-1.scn`). Everything from v0.2 on is uniform.
+The network is trained entirely on the engine's own self-play; the trainer and
+training data live outside this repository.
