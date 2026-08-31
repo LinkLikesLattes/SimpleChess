@@ -22,6 +22,9 @@ newest generation's label wins), shuffled on disk. Search is behavior-identical 
 2.5 at shipping defaults (verified: same bestmove/score/nodes on a fixed-depth suite
 with the same net). PGO build.
 
+BEATS 2.5 by +127 Elo [+118, +136] LOS 100%: +1322 =1408 -270 (67.5%) over 3000 games
+@100ms/1T/256MB, paired openings.
+
 ## v2.5 — 2026-08-23
 
 - Self-reports: `SimpleChess NNUE 2.5`
