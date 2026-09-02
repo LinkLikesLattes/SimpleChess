@@ -6,6 +6,13 @@
 
 <p align="center">A UCI chess engine in C++20 with a custom, self-play-trained neural-network evaluation.</p>
 
+<p align="center">
+  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess bullet rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.bullet.rating&label=bullet&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
+  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess blitz rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.blitz.rating&label=blitz&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
+  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess rapid rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.rapid.rating&label=rapid&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
+</p>
+<p align="center"><sub>Live ratings of the <a href="https://lichess.org/@/SimpleChessNNUE">SimpleChessNNUE</a> bot in Lichess's bot pool.</sub></p>
+
 ---
 
 SimpleChess pairs a modern, heavily-tuned alpha-beta search with a from-scratch
