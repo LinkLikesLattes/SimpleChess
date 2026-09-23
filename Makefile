@@ -69,6 +69,14 @@ INCLUDES  := -I$(SRC_DIR) -I$(LIB_INC) -I$(FATHOM_INC)
 # EXTRA also survives profile-build: the PGO phases append their flags to it,
 # so `make profile-build EXTRA="-DSC_X=1" ...` really compiles with SC_X=1.
 EXTRA     ?=
+# EMBED_NET=<path/to/SCNNUEv3-<date>.scn5> bakes that net into the executable (src/embed_net.cpp,
+# an .incbin in read-only data) so a single file runs with no net beside it -- the form phone
+# front-ends and tournament harnesses need. A newer dated net on disk still wins at startup and
+# EvalFile still overrides. Absolute path: under LTO the .incbin is resolved at link time.
+EMBED_NET ?=
+# The byte count is taken from the file here rather than from an end label in the assembly: a
+# Mach-O linker may reorder a second label's atom, and a size symbol must not depend on layout.
+EMBED_DEFS := $(if $(EMBED_NET),-DSC_EMBED_NET_PATH='"$(abspath $(EMBED_NET))"' -DSC_EMBED_NET_NAME='"$(notdir $(EMBED_NET))"' -DSC_EMBED_NET_SIZE=$(strip $(shell wc -c < $(EMBED_NET))),)
 CXXFLAGS  ?= $(STD) -O3 -DNDEBUG -flto $(ARCH) -funroll-loops $(WARN) $(INCLUDES) $(EXTRA)
 LDFLAGS   ?= -flto -pthread
 
@@ -84,11 +92,14 @@ $(EXE): $(OBJECTS)
 	$(CXX) $(OBJECTS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(VERSION_DEFS) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(VERSION_DEFS) $(EMBED_DEFS) -MMD -MP -c $< -o $@
 
 # Rebuild when the version string or the build recipe changes so the baked-in
 # identity never goes stale.
 $(OBJECTS): VERSION Makefile
+ifneq ($(EMBED_NET),)
+$(BUILD_DIR)/embed_net.o: $(EMBED_NET)
+endif
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

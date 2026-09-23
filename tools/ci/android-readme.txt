@@ -2,8 +2,8 @@ SimpleChess -- Android arm64 build
 ==================================
 
 Files
-  simplechess            the engine (UCI protocol), 64-bit Arm, fully static, position-independent
-  SCNNUEv*.scn5          the neural network the engine plays with -- REQUIRED, the engine exits without it
+  simplechess            the engine (UCI protocol), 64-bit Arm, fully static, position-independent.
+                         The neural network is EMBEDDED in this file: nothing else needs copying.
   README-ANDROID.txt     this file
 
 Which archive
@@ -14,13 +14,14 @@ Which archive
                              if the arm64 build does not start on your device.
 
 Install in DroidFish
-  1. Copy BOTH `simplechess` and the `.scn5` file into DroidFish's engine folder
+  1. Copy `simplechess` into DroidFish's engine folder
      (by default DroidFish/uci on internal storage, i.e. /storage/emulated/0/DroidFish/uci).
   2. In DroidFish, Settings > Engine settings > pick `simplechess`.
-  3. The engine looks for the net beside its binary and in a `nets/` subfolder. If it still
-     reports "no NNUE net could be loaded", open the engine's UCI options in DroidFish and set
-     EvalFile to the net's full path, e.g. /storage/emulated/0/DroidFish/uci/SCNNUEv3-2026-09-12.scn5
-  Any other UCI front-end: same idea -- keep the net beside the binary, or point EvalFile at it.
+  Any other UCI front-end or tournament harness: the single file is all it needs.
+
+Other networks
+  A different SCNNUEv<MAJOR>-<date>.scn5 placed beside the binary (or in a `nets/` subfolder) is
+  used instead when it is newer than the embedded one; the UCI option EvalFile overrides either.
 
 Notes
   Built by the repository's GitHub Actions workflow (.github/workflows/android.yml) from the

@@ -1,13 +1,14 @@
 # Android (arm64) build of SimpleChess for UCI front-ends such as DroidFish.
 #
 # Cross-compiles with the Android NDK preinstalled on GitHub's Ubuntu runner image and links a
-# fully static position-independent executable, the form Android execs and a phone front-end
-# can run (no dynamic loader, no shared libc++ to find). The ELF is checked for exactly that.
+# fully static position-independent executable with the network EMBEDDED (EMBED_NET), the form
+# Android execs and a phone front-end or tournament harness can run from the one file (no
+# dynamic loader, no shared libc++, no net beside it). The ELF is checked for exactly that.
 # The same objects are then linked once more as a plain static (non-PIE) executable purely to
 # RUN them: qemu-user cannot load a static-PIE built against Bionic (it faults before the first
 # syscall, on every qemu version tried), but it runs the plain static link, which differs from
-# the shipped file in nothing but the link mode. The run-test starts that binary with the
-# shipped net beside it and searches four positions to depth 12 at 1 thread; the node counts
+# the shipped file in nothing but the link mode. The run-test starts that binary ALONE -- no
+# net file anywhere near it -- and searches four positions to depth 12 at 1 thread; the node counts
 # are printed for comparison with a native build of the same source (they match when the
 # cross-compiled code is right).
 #
@@ -16,8 +17,8 @@
 #   arm64          -march=armv8.2-a+dotprod   phone SoCs from ~2018 on (Cortex-A75/A55 and newer): the build to use
 #   arm64-generic  -march=armv8-a             older 64-bit SoCs; correct, but the int8 layers run scalar, much slower
 #
-# Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + net +
-# install notes), deliberately never a release asset: releases stay source + net.
+# Runs on demand and on release tags. The output is a run ARTIFACT (tar.gz of binary + install
+# notes), deliberately never a release asset: releases stay source + net.
 name: Android build
 
 on:
@@ -74,14 +75,18 @@ jobs:
       # The Makefile takes the compiler and the target from the command line (CXX, ARCH) and
       # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs. The
       # desktop hash default (4 GB, zero-filled at startup) is lowered for a phone; the
-      # front-end sets Hash anyway. The second make relinks the SAME objects as a plain static
-      # executable for the run-test below (nothing is recompiled: same CXXFLAGS, only LDFLAGS).
+      # front-end sets Hash anyway. EMBED_NET bakes the repository's net into the binary. The
+      # second make relinks the SAME objects as a plain static executable for the run-test
+      # below (nothing is recompiled: same CXXFLAGS, only LDFLAGS).
       - name: Build (-march=${{ matrix.march }})
         run: |
           set -euo pipefail
-          FLAGS=(CXX="${{ steps.ndk.outputs.cxx }}" ARCH="-march=${{ matrix.march }}" EXTRA="-fPIE -DSC_DEFAULT_HASH=64")
+          NET=$(ls nets/SCNNUEv*.scn5 | head -1); test -n "$NET" || { echo "::error::no net in nets/"; exit 1; }
+          echo "embedding $NET"
+          FLAGS=(CXX="${{ steps.ndk.outputs.cxx }}" ARCH="-march=${{ matrix.march }}" EXTRA="-fPIE -DSC_DEFAULT_HASH=64" EMBED_NET="$NET")
           make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static-pie" 2>&1 | tee build.log
           grep -q -- "-march=${{ matrix.march }}" build.log || { echo "::error::target flag never reached a compile line"; exit 1; }
+          grep -q -- "-DSC_EMBED_NET_PATH" build.log || { echo "::error::EMBED_NET never reached a compile line"; exit 1; }
           make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static" EXE=simplechess-runtest 2>&1 | tee relink.log
           if grep -q -- ' -c ' relink.log; then echo "::error::the run-test relink recompiled sources (flag mismatch)"; exit 1; fi
 
@@ -104,14 +109,13 @@ jobs:
           "${{ steps.ndk.outputs.strip }}" simplechess
           ls -l simplechess simplechess-runtest
 
-      - name: Stage the archive (binary + net + install notes)
+      - name: Stage the archive (binary with embedded net + install notes)
         id: stage
         run: |
           set -euo pipefail
           NAME="simplechess-${{ steps.ndk.outputs.ver }}-android-${{ matrix.variant }}"
           mkdir -p "stage/$NAME"
           cp simplechess "stage/$NAME/"
-          cp nets/SCNNUEv*.scn5 "stage/$NAME/"
           cp tools/ci/android-readme.txt "stage/$NAME/README-ANDROID.txt"
           tar -C stage -czf "$NAME.tar.gz" "$NAME"
           ls -l "$NAME.tar.gz"
@@ -119,8 +123,8 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "dir=$PWD/stage/$NAME" >> "$GITHUB_OUTPUT"
 
-      # The run-test binary sits in a copy of the shipped layout (net beside it, same file
-      # name) so the engine's own net discovery is what gets exercised.
+      # The run-test binary sits ALONE in an empty directory, run from that directory, so the
+      # only net it can possibly find is the embedded one -- the property the phone needs.
       - name: Run the engine under qemu-user (${{ matrix.qemu_cpu }})
         env:
           QEMU_CPU: ${{ matrix.qemu_cpu }}
@@ -136,12 +140,13 @@ jobs:
           qemu-aarch64-static ./hello
           mkdir -p runtest
           cp simplechess-runtest runtest/simplechess
-          cp "${{ steps.stage.outputs.dir }}"/*.scn5 runtest/
-          if ! python3 -u tools/ci/uci_smoke.py qemu-aarch64-static "$PWD/runtest/simplechess" --depth 12 --timeout 900; then
+          SMOKE="$PWD/tools/ci/uci_smoke.py"; BIN="$PWD/runtest/simplechess"
+          if ! (cd runtest && python3 -u "$SMOKE" qemu-aarch64-static "$BIN" --depth 12 --timeout 900 | tee smoke.log); then
             echo "== run-test failed; startup syscall trace:"
-            qemu-aarch64-static -strace "$PWD/runtest/simplechess" < /dev/null 2>&1 | tail -40 || true
+            (cd runtest && qemu-aarch64-static -strace "$BIN" < /dev/null 2>&1 | tail -40) || true
             exit 1
           fi
+          grep -q '(embedded)' runtest/smoke.log || { echo "::error::the engine did not load the EMBEDDED net"; exit 1; }
 
       - uses: actions/upload-artifact@v7
         with:

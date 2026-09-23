@@ -81,14 +81,16 @@ any AVX2 machine (Haswell or newer) use `make ARCH="-march=x86-64-v3"`.
 `profile-build` additionally needs Python 3 with
 [python-chess](https://pypi.org/project/chess/) (`pip install chess`) for its
 training workload. A `CMakeLists.txt` is provided for IDE / CMake users.
+`make EMBED_NET=nets/SCNNUEv3-2026-09-12.scn5` bakes the network into the executable
+for a single-file deployment; a newer net beside the binary still takes precedence.
 
 **Android (arm64).** The repository's GitHub Actions workflow
 (`.github/workflows/android.yml`) cross-compiles a fully static build for 64-bit
 Android phones — for DroidFish or any other UCI front-end — on every release tag and
 on demand. Open the *Android build* run under the Actions tab and download
 `simplechess-<version>-android-arm64.tar.gz` (or `-arm64-generic` for SoCs older
-than about 2018, which lack the Arm dot-product extension); the archive holds the
-binary, the network and install notes.
+than about 2018, which lack the Arm dot-product extension). The network is embedded
+in that binary — nothing else needs copying; the archive adds only install notes.
 
 ## Run
 

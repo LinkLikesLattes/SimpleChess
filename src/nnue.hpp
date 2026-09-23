@@ -15,6 +15,7 @@
 // are later speed passes.
 // -----------------------------------------------------------------------------
 
+#include <cstddef>
 #include <string>
 
 #include "types.hpp"
@@ -26,6 +27,9 @@ namespace engine::nnue {
 // hand-crafted-eval fallback in 3.0.0: startup aborts if no net can be loaded at
 // all, so once running, a net is always present.
 bool load(const std::string& path);
+
+// Same loader over an in-memory image of a net file (the embedded net, embed_net.hpp).
+bool load_memory(const void* data, std::size_t size);
 
 // True once a network is loaded and evaluate() will use it.
 [[nodiscard]] bool loaded() noexcept;

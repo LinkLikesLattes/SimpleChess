@@ -4,6 +4,23 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.3.1 — 2026-09-23
+
+- Self-reports: `SimpleChess 3.3.1`
+- Source VERSION at save time: `3.3.1`
+
+### Embedded network (Android build)
+
+`make EMBED_NET=nets/SCNNUEv3-<date>.scn5` bakes the network into the executable (`src/embed_net.cpp`:
+an `.incbin` into read-only data, so the file never passes through the compiler) and a single file
+then runs with nothing beside it. Startup ranks the embedded net with the on-disk candidates by the
+same dated version — a newer net beside the binary or in `nets/` still wins and `EvalFile` still
+overrides — and loads it through the same parser as a file (`nnue::load_memory` over an in-memory
+stream), so the two paths cannot diverge. The Android workflow now builds with it, run-tests the
+binary with no net file present, and ships `simplechess` + `README-ANDROID.txt` only. Reported by
+Arzam18 (issue #1): a phone tournament harness copies the executable alone, and the 3.3.0 artifact
+exited for want of its net.
+
 ## v3.3.0 — 2026-09-22
 
 - Self-reports: `SimpleChess 3.3.0`

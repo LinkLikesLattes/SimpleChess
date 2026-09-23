@@ -32,6 +32,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <istream>
+#include <streambuf>
 #include <new>
 #include <vector>
 
@@ -382,7 +384,7 @@ bool g_i8body = false;     // SCNNUE_I8BODY=1: opt into the (lossy, post-hoc) in
                            // for only ~3% nps; a real int8 body needs quantization-aware retrain (4.4).
 
 template <class Vec>   // std::vector<float> or the 64-B-aligned WVec<float> (G3)
-bool read_arr(std::ifstream& f, Vec& dst, std::uint32_t expect) {
+bool read_arr(std::istream& f, Vec& dst, std::uint32_t expect) {
     std::uint32_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 4);
     if (!f || n != expect) return false;
@@ -391,7 +393,7 @@ bool read_arr(std::ifstream& f, Vec& dst, std::uint32_t expect) {
            static_cast<std::streamsize>(n) * static_cast<std::streamsize>(sizeof(typename Vec::value_type)));
     return static_cast<bool>(f);
 }
-bool read_i16(std::ifstream& f, std::vector<std::int16_t>& dst, std::uint32_t expect) {
+bool read_i16(std::istream& f, std::vector<std::int16_t>& dst, std::uint32_t expect) {
     std::uint32_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 4);
     if (!f || n != expect) return false;
@@ -400,7 +402,7 @@ bool read_i16(std::ifstream& f, std::vector<std::int16_t>& dst, std::uint32_t ex
     return static_cast<bool>(f);
 }
 template <class Vec>   // std::vector<int8_t> or the 64-B-aligned WVec<int8_t> (G3)
-bool read_i8(std::ifstream& f, Vec& dst, std::uint32_t expect) {
+bool read_i8(std::istream& f, Vec& dst, std::uint32_t expect) {
     std::uint32_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 4);
     if (!f || n != expect) return false;
@@ -417,9 +419,7 @@ inline float screlu(float x) {
 
 }  // namespace
 
-bool load(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
+static bool load_stream(std::istream& f) {
 
     char magic[4];
     f.read(magic, 4);
@@ -536,6 +536,26 @@ bool load(const std::string& path) {
     n.loaded = true;
     g_net = std::move(n);
     return true;
+}
+
+bool load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    return load_stream(f);
+}
+
+// Same loader over an in-memory image of a net file (the embedded net, see embed_net.hpp): a
+// read-only streambuf over the bytes, so the parser is shared and the two paths cannot diverge.
+bool load_memory(const void* data, std::size_t size) {
+    if (data == nullptr || size == 0) return false;
+    struct membuf : std::streambuf {
+        membuf(const char* b, std::size_t n) {
+            char* c = const_cast<char*>(b);
+            setg(c, c, c + n);
+        }
+    } buf(static_cast<const char*>(data), size);
+    std::istream f(&buf);
+    return load_stream(f);
 }
 
 bool loaded() noexcept { return g_net.loaded; }

@@ -18,6 +18,7 @@
 #include <system_error>
 #include <vector>
 
+#include "embed_net.hpp"
 #include "nnue.hpp"
 #include "syzygy.hpp"
 
@@ -107,20 +108,38 @@ void UCI::try_load_default_net() {
         }
     }
 
-    // 1. Preferred: the newest net of this engine's own major.
+    // A net embedded in the executable (Makefile EMBED_NET=..., src/embed_net.cpp) is one
+    // more candidate, ranked by the same dated version: a newer net on disk still wins,
+    // and with no file at all it is the net. Its name carries the date, like a file's.
+    std::vector<int> ver_emb;
+    if (embed::net_size() > 0) ver_emb = net_version_of(std::string(embed::net_name()));
+    const bool emb_own = !ver_emb.empty() && ver_emb[0] == kNetMajor;
+    const bool emb_low = !ver_emb.empty() && ver_emb[0] <  kNetMajor;
+    const auto load_embedded = [&](const char* note) {
+        if (!nnue::load_memory(embed::net_data(), embed::net_size())) return false;
+        std::cout << "info string NNUE loaded: " << embed::net_name() << " (embedded)" << note
+                  << std::endl;
+        return true;
+    };
+
+    // 1. Preferred: the newest net of this engine's own major, embedded or on disk.
+    if (emb_own && (ver_own.empty() || ver_emb > ver_own) && load_embedded("")) return;
     if (!best_own.empty() && nnue::load(best_own.string())) {
         std::cout << "info string NNUE loaded: " << best_own.string() << std::endl;
         return;
     }
+    if (emb_own && load_embedded("")) return;  // the on-disk file was unreadable
 
     // 2. Transition fallback: no own-major net yet -> load the newest LOWER-major
     //    net (e.g. the pre-3.0 "SCNNUEv2-5.scn5", same SCN5 architecture) and SAY SO.
+    const std::string low_note = "  (no SCNNUEv" + std::to_string(kNetMajor) +
+                                 "-<date>.scn5 found for version " SC_VERSION "; using newest available)";
+    if (emb_low && (ver_low.empty() || ver_emb > ver_low) && load_embedded(low_note.c_str())) return;
     if (!best_low.empty() && nnue::load(best_low.string())) {
-        std::cout << "info string NNUE loaded: " << best_low.string()
-                  << "  (no SCNNUEv" << kNetMajor << "-<date>.scn5 found for version "
-                  << SC_VERSION << "; using newest available)" << std::endl;
+        std::cout << "info string NNUE loaded: " << best_low.string() << low_note << std::endl;
         return;
     }
+    if (emb_low && load_embedded(low_note.c_str())) return;
 
     // 3. Nothing loaded. There is NO hand-crafted-eval fallback in 3.0.0: a netless
     //    engine is a different, weaker program and every tool here depends on the
