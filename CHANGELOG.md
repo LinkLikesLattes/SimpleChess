@@ -4,6 +4,27 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.3.2 — 2026-09-24
+
+- Self-reports: `SimpleChess 3.3.2`
+- Source VERSION at save time: `3.3.2`
+
+### Android build: static executable (fixes the 3.3.1 startup crash)
+
+The 3.3.1 Android binary segfaulted the moment it started, on real devices (DroidFish "Failed to
+start engine"; a bare run in Termux: `Segmentation fault`). It was linked as a static-PIE, and
+Bionic's static startup code reads `main` and the init arrays through the GOT before anything applies
+the executable's own `R_AARCH64_RELATIVE` relocations: in the shipped file the GOT slot holding
+`main` is zero with its relocation still pending, so startup jumps through null before `main` runs.
+The 3.3.0 notes put the same crash under qemu down to qemu; it was this, and the CI never caught it
+because it run-tested a second, plain-static link of the objects instead of the shipped file. The
+workflow now ships that plain static executable (Android's position-independence rule lives in its
+dynamic linker, which a static executable never meets; the kernel loads it directly), asserts it is
+`ET_EXEC` with no `PT_INTERP` and no `PT_DYNAMIC` (nothing to relocate at startup), and run-tests
+the shipped file itself — the stripped binary unpacked from the uploaded archive, `cmp`-checked,
+alone in an empty directory. Engine source unchanged; play is identical to 3.3.1. Reported by
+Arzam18 (issue #1).
+
 ## v3.3.1 — 2026-09-23
 
 - Self-reports: `SimpleChess 3.3.1`

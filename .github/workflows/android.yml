@@ -1,16 +1,19 @@
 # Android (arm64) build of SimpleChess for UCI front-ends such as DroidFish.
 #
 # Cross-compiles with the Android NDK preinstalled on GitHub's Ubuntu runner image and links a
-# fully static position-independent executable with the network EMBEDDED (EMBED_NET), the form
-# Android execs and a phone front-end or tournament harness can run from the one file (no
-# dynamic loader, no shared libc++, no net beside it). The ELF is checked for exactly that.
-# The same objects are then linked once more as a plain static (non-PIE) executable purely to
-# RUN them: qemu-user cannot load a static-PIE built against Bionic (it faults before the first
-# syscall, on every qemu version tried), but it runs the plain static link, which differs from
-# the shipped file in nothing but the link mode. The run-test starts that binary ALONE -- no
-# net file anywhere near it -- and searches four positions to depth 12 at 1 thread; the node counts
-# are printed for comparison with a native build of the same source (they match when the
-# cross-compiled code is right).
+# fully static executable with the network EMBEDDED (EMBED_NET): a phone front-end or tournament
+# harness can run it from the one file (no dynamic loader, no shared libc++, no net beside it).
+#
+# Static, NOT static-PIE. Android's position-independence rule is enforced by its dynamic linker,
+# which a static executable never meets; the kernel loads a plain static ELF directly. A static-PIE
+# is worse than unnecessary: Bionic's static startup code reads `main` and the init arrays through
+# the GOT before anything applies the executable's own R_AARCH64_RELATIVE relocations, so it jumps
+# through null and dies before main. 3.3.1 shipped that form and segfaulted at startup on phones.
+#
+# The run-test executes the SHIPPED file itself -- the stripped binary taken back out of the archive,
+# alone in an empty directory -- under qemu-user, and searches four positions to depth 12 at 1
+# thread; the node counts are printed for comparison with a native build of the same source (they
+# match when the cross-compiled code is right). Nothing is relinked or rebuilt for the test.
 #
 # Two variants, because the int8 network layers have no NEON path without the Arm dot-product
 # extension (src/nnue.cpp is guarded on __ARM_FEATURE_DOTPROD and otherwise falls back to scalar):
@@ -75,39 +78,31 @@ jobs:
       # The Makefile takes the compiler and the target from the command line (CXX, ARCH) and
       # keeps its own optimisation set; EXTRA and LDFLAGS add only what Android needs. The
       # desktop hash default (4 GB, zero-filled at startup) is lowered for a phone; the
-      # front-end sets Hash anyway. EMBED_NET bakes the repository's net into the binary. The
-      # second make relinks the SAME objects as a plain static executable for the run-test
-      # below (nothing is recompiled: same CXXFLAGS, only LDFLAGS).
+      # front-end sets Hash anyway. EMBED_NET bakes the repository's net into the binary.
       - name: Build (-march=${{ matrix.march }})
         run: |
           set -euo pipefail
           NET=$(ls nets/SCNNUEv*.scn5 | head -1); test -n "$NET" || { echo "::error::no net in nets/"; exit 1; }
           echo "embedding $NET"
-          FLAGS=(CXX="${{ steps.ndk.outputs.cxx }}" ARCH="-march=${{ matrix.march }}" EXTRA="-fPIE -DSC_DEFAULT_HASH=64" EMBED_NET="$NET")
-          make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static-pie" 2>&1 | tee build.log
+          make -j"$(nproc)" CXX="${{ steps.ndk.outputs.cxx }}" ARCH="-march=${{ matrix.march }}" \
+               EXTRA="-DSC_DEFAULT_HASH=64" EMBED_NET="$NET" LDFLAGS="-flto -pthread -static" 2>&1 | tee build.log
           grep -q -- "-march=${{ matrix.march }}" build.log || { echo "::error::target flag never reached a compile line"; exit 1; }
           grep -q -- "-DSC_EMBED_NET_PATH" build.log || { echo "::error::EMBED_NET never reached a compile line"; exit 1; }
-          make -j"$(nproc)" "${FLAGS[@]}" LDFLAGS="-flto -pthread -static" EXE=simplechess-runtest 2>&1 | tee relink.log
-          if grep -q -- ' -c ' relink.log; then echo "::error::the run-test relink recompiled sources (flag mismatch)"; exit 1; fi
 
-      - name: Verify the ELFs, then strip the shipped one
+      # A plain static executable: ET_EXEC, no PT_INTERP, no PT_DYNAMIC (so no dynamic relocations
+      # for anything to apply at startup -- the static-PIE failure mode above cannot occur).
+      - name: Verify the ELF, then strip it
         run: |
           set -euo pipefail
-          file simplechess simplechess-runtest
+          file simplechess
           H=$(readelf -h simplechess)
           echo "$H" | grep -q 'Machine:.*AArch64' || { echo "::error::not an AArch64 ELF"; exit 1; }
-          echo "$H" | grep -q 'Type:.*DYN'         || { echo "::error::not position-independent (Android refuses a non-PIE executable)"; exit 1; }
-          if readelf -d simplechess | grep -q NEEDED; then
-            echo "::error::binary has shared-library dependencies"; readelf -d simplechess; exit 1
-          fi
-          if readelf -l simplechess | grep -q INTERP; then
-            echo "::error::binary wants a dynamic loader (not static)"; exit 1
-          fi
-          R=$(readelf -h simplechess-runtest)
-          echo "$R" | grep -q 'Machine:.*AArch64' || { echo "::error::run-test binary is not AArch64"; exit 1; }
-          echo "$R" | grep -q 'Type:.*EXEC'        || { echo "::error::run-test binary is not a plain static executable"; exit 1; }
+          echo "$H" | grep -q 'Type:.*EXEC'        || { echo "::error::not a plain static executable (a static-PIE crashes at startup on Bionic)"; exit 1; }
+          L=$(readelf -l simplechess)
+          if echo "$L" | grep -q INTERP;  then echo "::error::binary wants a dynamic loader (not static)"; exit 1; fi
+          if echo "$L" | grep -q DYNAMIC; then echo "::error::binary has a dynamic section (relocations to apply at startup)"; echo "$L"; exit 1; fi
           "${{ steps.ndk.outputs.strip }}" simplechess
-          ls -l simplechess simplechess-runtest
+          ls -l simplechess
 
       - name: Stage the archive (binary with embedded net + install notes)
         id: stage
@@ -121,11 +116,11 @@ jobs:
           ls -l "$NAME.tar.gz"
           tar tzf "$NAME.tar.gz"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          echo "dir=$PWD/stage/$NAME" >> "$GITHUB_OUTPUT"
 
-      # The run-test binary sits ALONE in an empty directory, run from that directory, so the
+      # The binary under test is unpacked from the archive being uploaded and sits ALONE in an
+      # empty directory, run from that directory: it is byte-for-byte the shipped file, and the
       # only net it can possibly find is the embedded one -- the property the phone needs.
-      - name: Run the engine under qemu-user (${{ matrix.qemu_cpu }})
+      - name: Run the shipped binary under qemu-user (${{ matrix.qemu_cpu }})
         env:
           QEMU_CPU: ${{ matrix.qemu_cpu }}
         run: |
@@ -133,20 +128,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static > /dev/null
           qemu-aarch64-static --version | head -1
-          # Toolchain + emulator sanity first: a trivial program built and linked like the
-          # run-test binary must run, or a failure below says nothing about the engine.
-          printf '#include <cstdio>\n#include <filesystem>\nint main(int, char** argv){ std::printf("hello from %%s\\n", std::filesystem::canonical(argv[0]).c_str()); }\n' > hello.cpp
-          "${{ steps.ndk.outputs.cxx }}" -std=c++20 -O2 -fPIE -march=${{ matrix.march }} hello.cpp -o hello -pthread -static
-          qemu-aarch64-static ./hello
-          mkdir -p runtest
-          cp simplechess-runtest runtest/simplechess
+          NAME="${{ steps.stage.outputs.name }}"
+          mkdir -p unpack runtest
+          tar -C unpack -xzf "$NAME.tar.gz"
+          cp "unpack/$NAME/simplechess" runtest/simplechess
+          cmp runtest/simplechess simplechess || { echo "::error::the file under test is not the shipped file"; exit 1; }
+          sha256sum runtest/simplechess
           SMOKE="$PWD/tools/ci/uci_smoke.py"; BIN="$PWD/runtest/simplechess"
-          if ! (cd runtest && python3 -u "$SMOKE" qemu-aarch64-static "$BIN" --depth 12 --timeout 900 | tee smoke.log); then
+          if ! (cd runtest && python3 -u "$SMOKE" qemu-aarch64-static "$BIN" --depth 12 --timeout 900 | tee ../smoke.log); then
             echo "== run-test failed; startup syscall trace:"
             (cd runtest && qemu-aarch64-static -strace "$BIN" < /dev/null 2>&1 | tail -40) || true
             exit 1
           fi
-          grep -q '(embedded)' runtest/smoke.log || { echo "::error::the engine did not load the EMBEDDED net"; exit 1; }
+          grep -q '(embedded)' smoke.log || { echo "::error::the engine did not load the EMBEDDED net"; exit 1; }
 
       - uses: actions/upload-artifact@v7
         with:
@@ -155,13 +149,10 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # Post-mortem only: a build that failed the run-test is kept a week for inspection
-      # (the shipped layout plus the unstripped run-test binary).
+      # Post-mortem only: a build that failed the run-test is kept a week for inspection.
       - if: failure() && steps.stage.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.stage.outputs.name }}-FAILED-runtest
-          path: |
-            ${{ steps.stage.outputs.dir }}
-            simplechess-runtest
+          path: ${{ steps.stage.outputs.name }}.tar.gz
           retention-days: 7

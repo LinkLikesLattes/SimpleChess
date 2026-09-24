@@ -2,7 +2,7 @@ SimpleChess -- Android arm64 build
 ==================================
 
 Files
-  simplechess            the engine (UCI protocol), 64-bit Arm, fully static, position-independent.
+  simplechess            the engine (UCI protocol), 64-bit Arm, fully static (no loader, no libraries).
                          The neural network is EMBEDDED in this file: nothing else needs copying.
   README-ANDROID.txt     this file
 
