@@ -165,6 +165,7 @@ void UCI::handle_uci() const {
     std::cout << "option name Ponder type check default false\n";
     std::cout << "option name MultiPV type spin default 1 min 1 max " << MAX_MOVES << "\n";
     std::cout << "option name UCI_Chess960 type check default false\n";
+    std::cout << "option name UCI_ShowWDL type check default false\n";
     std::cout << "option name Clear Hash type button\n";
     std::cout << "option name OwnBook type check default false\n";
     std::cout << "option name Book File type string default <empty>\n";
@@ -286,6 +287,9 @@ void UCI::handle_setoption(std::istringstream& is) {
         // castling is spoken king-to-rook ("e1h1") and FENs may carry X-FEN or Shredder
         // castling fields; DFRC needs nothing extra (rights are per colour).
         chess960_ = iequals(value, "true") || value == "1";
+    } else if (iequals(name, "UCI_ShowWDL")) {
+        // Win/draw/loss per mille in the info lines (display only; see wdl.hpp).
+        set_show_wdl(iequals(value, "true") || value == "1");
     } else if (iequals(name, "Clear Hash")) {
         search_.stop();
         search_.wait();

@@ -172,6 +172,10 @@ class Search;
 // by the self-play data generator to diversify games; see search.cpp.
 void set_root_noise(int cp);
 
+// UCI_ShowWDL: add "wdl W D L" (win/draw/loss per mille for the side to move, from the model in
+// wdl.hpp) to every scored info line. Display only; takes effect from the next report.
+void set_show_wdl(bool on);
+
 // Silence all UCI output (info/bestmove) from the search. Used by the in-engine
 // game generator (`gengame`) so its many per-ply searches don't spam stdout.
 void set_gen_silent(bool silent);

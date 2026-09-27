@@ -116,7 +116,7 @@ run: all
 # instrument -> run workload -> rebuild with -fprofile-use). Measured at or above
 # the plain LTO build, so it's the kept build for the engine. Provide a net so the
 # NNUE paths get profiled; weights don't matter, only executed code paths.
-#   make profile-build PGO_NET=nets/SCNNUEv3-2026-09-12.scn5
+#   make profile-build PGO_NET=nets/SCNNUEv3-2026-09-26.scn5
 LLVM_PROFDATA ?= $(shell xcrun --find llvm-profdata 2>/dev/null || echo llvm-profdata)
 # Sibling of BUILD_DIR (NOT nested) so the phase-3 "rm -rf BUILD_DIR" cannot wipe
 # the profile we just merged.

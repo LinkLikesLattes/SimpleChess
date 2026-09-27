@@ -4,6 +4,30 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.4.0 — 2026-09-27
+
+- Self-reports: `SimpleChess 3.4.0`
+- Source VERSION at save time: `3.4.0`
+
+### Win/draw/loss output (`UCI_ShowWDL`)
+
+New check option `UCI_ShowWDL` (default off). When on, every scored `info` line — each MultiPV line and
+any bound line — also carries `wdl W D L`: the side to move's win/draw/loss chances in per mille (sum
+1000), placed after the score and any `lowerbound`/`upperbound` tag. The chances come from a logistic
+model in the score whose centre and width depend on the material on the board; mates and tablebase
+results show `1000 0 0` / `0 0 1000`. Display only: the reported `cp` is the unchanged raw score, and the
+search is node-identical with the option on or off (and to 3.3.2). The current model is preliminary —
+fitted on the engine's own fast self-play to make the output work end to end — and will be replaced by
+a new model.
+
+### Network: SCNNUEv3-2026-09-26
+
+`nets/SCNNUEv3-2026-09-26.scn5` replaces `SCNNUEv3-2026-09-12`. Same architecture; the training set
+grew from 1.69 billion to 2.34 billion positions (+38%): the generation-28 self-play sweep combined with
+the previous pool, one row per position with the newest label kept. 70 superbatches of ~100M positions,
+eval/result blend 0.8 → 0.7. Against the 09-12 net on the same 3.3.2 engine at 10+0.1: +24 Elo [+13, +35] (590 pairs,
+stopped by hand).
+
 ## v3.3.2 — 2026-09-24
 
 - Self-reports: `SimpleChess 3.3.2`

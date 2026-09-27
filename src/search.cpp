@@ -41,6 +41,7 @@
 #include "nnue.hpp"
 #include "see.hpp"
 #include "syzygy.hpp"
+#include "wdl.hpp"
 
 namespace engine {
 
@@ -50,6 +51,7 @@ namespace engine {
 // scores are never perturbed. Off (0) by default — normal play is unaffected.
 namespace {
 std::atomic<int>              g_root_noise{0};
+std::atomic<bool>             g_show_wdl{false};     // UCI_ShowWDL: display only (setoption may arrive mid-search)
 bool                          g_gen_silent = false;  // set before gengame's searches (single UCI thread)
 thread_local std::mt19937_64  t_noise_rng{std::random_device{}()};
 thread_local std::uint64_t    t_noise_seed{0};   // fixed per search (set in think())
@@ -119,6 +121,8 @@ void pass_param_options(std::ostream& out) {
 }
 
 void set_root_noise(int cp) { g_root_noise.store(cp < 0 ? 0 : cp, std::memory_order_relaxed); }
+
+void set_show_wdl(bool on) { g_show_wdl.store(on, std::memory_order_relaxed); }
 
 // Set before any gengame search on the UCI thread; worker threads (created in
 // start()) observe it via the thread-creation happens-before. Not changed mid-search.
@@ -1686,6 +1690,9 @@ void Worker::report_multipv(Depth depth) {
     const std::uint64_t nps   = nodes * 1000ULL / static_cast<std::uint64_t>(ms);
     const bool          c960  = pool_.root_.chess960();
     const int           rn    = g_root_noise.load(std::memory_order_relaxed);
+    // Read once per report so every line of it agrees; the chances use the root's material.
+    const bool          show_wdl = g_show_wdl.load(std::memory_order_relaxed);
+    const int           root_mat = show_wdl ? wdl_material(pool_.root_) : 0;
 
     for (int i = 0; i < multipv_; ++i) {
         const RootMove& rm       = root_moves_[static_cast<std::size_t>(i)];
@@ -1699,6 +1706,7 @@ void Worker::report_multipv(Depth depth) {
         std::ostringstream ss;
         ss << "info depth " << d << " seldepth " << rm.seldepth << " multipv " << (i + 1) << " score ";
 
+        Value shown = v;   // the value the score token reports (win/draw/loss is computed from it)
         if (is_mate_score(v)) {
             // UCI wants distance in moves; positive when we deliver the mate.
             const int plies      = (v > 0) ? (VALUE_MATE - v) : (VALUE_MATE + v);
@@ -1709,12 +1717,19 @@ void Worker::report_multipv(Depth depth) {
             // training label) is the move's true eval, not the noisy one.
             const Value clean = (rn > 0) ? v - root_noise_offset(rm.move, rn) : v;
             ss << "cp " << clean;
+            shown = clean;
         }
 
         // Previous-iteration scores are exact whatever their flags say.
         if (!use_prev) {
             if (rm.inexact_lower)      ss << " lowerbound";
             else if (rm.inexact_upper) ss << " upperbound";
+        }
+
+        // After the bound tag: a GUI parser may read a bound only directly after the score value.
+        if (show_wdl) {
+            const WdlPermille p = wdl_from_value(shown, root_mat);
+            ss << " wdl " << p.win << ' ' << p.draw << ' ' << p.loss;
         }
 
         ss << " nodes " << nodes << " nps " << nps << " time " << ms << " tbhits "
