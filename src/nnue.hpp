@@ -3,16 +3,15 @@
 // -----------------------------------------------------------------------------
 // nnue.hpp
 //
-// HalfKP NNUE evaluation for SimpleChessNNUE v0.1. Sits behind the same
-// side-to-move-relative centipawn contract as the hand-crafted eval, so search
-// consumes it unchanged. The network file (.scn) is produced by
-// train/export.py; the feature indexing and cp = 400 * logit output scaling
-// must match train/data.py and train/model.py exactly (see memory:
-// nnue-encoding-conventions).
-//
-// v0.1 does a full accumulator recompute per call in float — simple and exactly
-// matches the Python trainer. Incremental updates and int8/int16 quantization
-// are later speed passes.
+// NNUE evaluation: the engine's only evaluation, in side-to-move-relative
+// centipawns. Inputs are king-bucketed (10 buckets, horizontally mirrored)
+// piece-square features plus piece-threat and pawn-pair features; the feature
+// transformer feeds a pairwise-activated hidden layer and three small layers
+// selected by one of 8 material output buckets. The playing net is the int8
+// ".scn5" format; the trainer's float export ".scn4" also loads (it drives the
+// self-play labeler). The search keeps the feature-transformer accumulator
+// incrementally (acc_make / acc_unmake below); outside a search, evaluate()
+// recomputes it from the board.
 // -----------------------------------------------------------------------------
 
 #include <cstddef>
@@ -64,6 +63,10 @@ void acc_make(const Board& before, Move m);
 
 // Pop the last pushed accumulator. Call immediately AFTER board.unmakeMove(m).
 void acc_unmake();
+
+// Drop this thread's incremental state: evaluate() recomputes from the board again. For callers
+// outside the search (debug commands) that used acc_reset and must not leave a stale base behind.
+void acc_clear();
 
 // Null move: position unchanged, only side-to-move flips. Call around
 // makeNullMove / unmakeNullMove.

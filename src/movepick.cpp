@@ -28,10 +28,22 @@ constexpr int kUnderPromoScore = -3'000'000;
 MovePicker::MovePicker(const Board& board, const History& hist, const OrderingContext& ctx,
                        bool captures_only)
     : board_(board) {
-    if (captures_only && !board.inCheck())
+    if (captures_only && !board.inCheck()) {
         chess::movegen::legalmoves<chess::movegen::MoveGenType::CAPTURE>(moves_, board);
-    else
+        // The capture generator leaves out non-capturing promotions; a queening move belongs at
+        // the horizon as much as a capture does. Only when a pawn stands on its 7th rank.
+        const Color    us    = board.sideToMove();
+        const Bitboard rank7 = Bitboard(us == Color::WHITE ? 0x00FF000000000000ULL : 0x000000000000FF00ULL);
+        if (SC_QS_PROMO && !(board.pieces(PieceType::PAWN, us) & rank7).empty()) {
+            Movelist quiet;
+            chess::movegen::legalmoves<chess::movegen::MoveGenType::QUIET>(quiet, board,
+                                                                         chess::PieceGenType::PAWN);
+            for (const Move m : quiet)
+                if (m.typeOf() == Move::PROMOTION && m.promotionType() == PieceType::QUEEN) moves_.add(m);
+        }
+    } else {
         chess::movegen::legalmoves(moves_, board);
+    }
 
     score(hist, ctx);
 }

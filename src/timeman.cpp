@@ -14,7 +14,10 @@
 // thinking matters. That directly fixes "burns 30s reaching depth 30 on move 2".
 //
 // On top of that formula sits a hard project cap: a move never spends more
-// than min(60s, 10% of the remaining clock) — see kMaxMoveMs / kMaxMoveFraction.
+// than 60 s, and in sudden death / increment play never more than 10% of the
+// remaining clock — see kMaxMoveMs / kMaxMoveFraction. (A moves-to-go control is
+// already rationed by its move count: with `movestogo 1` the move may use most of
+// the clock, because the rest would be unused when the control is reached.)
 // -----------------------------------------------------------------------------
 
 #include "timeman.hpp"
@@ -29,8 +32,8 @@ namespace {
 // the cost of actually emitting the move: the UCI `Move Overhead` option, carried in
 // SearchLimits::move_overhead_ms (default 30). Read per call below, never hard-coded.
 
-// Project-level hard ceiling on a single move: never more than 60 s, and never
-// more than this fraction of the remaining clock — whichever is smaller.
+// Project-level hard ceiling on a single move: never more than 60 s, and in sudden
+// death / increment play never more than this fraction of the remaining clock.
 constexpr double kMaxMoveMs       = 60'000.0;
 constexpr double kMaxMoveFraction = 0.10;
 
@@ -49,8 +52,12 @@ constexpr double kNoIncMaxFraction = 0.05; // ...and <= 5% of the remaining cloc
 TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
     TimeBudget budget;
 
-    // Depth-, node-, mate-limited or infinite searches are not clock-bound.
-    if (!limits.uses_time_control() && limits.movetime == 0) {
+    // Infinite analysis ignores any clock. Otherwise a given clock always applies (depth, nodes
+    // and mate limits are enforced by the search on top of it); a search bounded only by depth,
+    // nodes or mate is not clock-bound.
+    const bool bounded = limits.depth > 0 || limits.nodes > 0 || limits.mate > 0;
+    const bool clock   = limits.movetime > 0 || limits.time[static_cast<int>(stm)] > 0;
+    if (limits.infinite || (bounded && !clock)) {
         budget.use_clock = false;
         return budget;
     }
@@ -79,7 +86,17 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
 
     // moves-to-go: cap at 50 so a distant time control doesn't make us hoard;
     // 0 (from the caller) means sudden death / increment only.
-    const int    mtg = limits.movestogo > 0 ? std::min(limits.movestogo, 50) : 50;
+    int mtg = limits.movestogo > 0 ? std::min(limits.movestogo, 50) : 50;
+    // Sudden death: 50 is only a guess at the moves left, and when the overhead exceeds the
+    // increment the reserve below, (2 + mtg) x overhead - (mtg - 1) x inc, swallows the whole
+    // clock at low time (with no increment once time_left < 52 x overhead: 1.56 s at 30 ms,
+    // 5.2 s at 100 ms), leaving ~1 ms a move. Shorten the horizon just enough that the reserve
+    // never takes more than half the remaining clock. A real moves-to-go count is never
+    // shortened, and with inc >= overhead the reserve never grows, so nothing changes there.
+    if (limits.movestogo == 0 && overhead > inc) {
+        const double fit = (0.5 * time_left - inc - 2.0 * overhead) / (overhead - inc);
+        mtg = std::clamp(static_cast<int>(fit), 1, mtg);
+    }
     const double ply = static_cast<double>(game_ply);
 
     // Effective time we may plan to consume before the next control, keeping a
@@ -116,9 +133,10 @@ TimeBudget compute_budget(const SearchLimits& limits, Color stm, int game_ply) {
     double maximum =
         std::max(optimum, std::min(0.8097 * time_left - overhead, max_scale * optimum));
 
-    // ---- Project hard cap: <= min(60s, fraction of remaining) ----
-    const double cap = std::min(kMaxMoveMs,
-                                (no_increment ? kNoIncMaxFraction : kMaxMoveFraction) * time_left);
+    // ---- Project hard cap: <= 60 s, and in sudden death <= a fraction of remaining ----
+    const double cap = limits.movestogo > 0
+                           ? kMaxMoveMs
+                           : std::min(kMaxMoveMs, (no_increment ? kNoIncMaxFraction : kMaxMoveFraction) * time_left);
     optimum          = std::min(optimum, cap);
     maximum          = std::min(maximum, cap);
 

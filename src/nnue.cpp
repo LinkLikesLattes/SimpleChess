@@ -132,6 +132,7 @@ constexpr std::array<int, 32> BUCKET_LAYOUT = {
 };
 constexpr std::array<int, 8> MIRROR = {0, 1, 2, 3, 3, 2, 1, 0};
 inline int king_bucket(int sq) { return BUCKET_LAYOUT[(sq / 8) * 4 + MIRROR[sq % 8]]; }
+constexpr int kKingBuckets = *std::max_element(BUCKET_LAYOUT.begin(), BUCKET_LAYOUT.end()) + 1;
 
 inline int file_of(int sq) { return sq & 7; }
 inline int rank_of(int sq) { return sq >> 3; }
@@ -439,7 +440,17 @@ static bool load_stream(std::istream& f) {
     n.input_buckets = int(hdr[2]);
     n.l2 = int(hdr[3]);
     n.out_buckets = int(hdr[4]);
-    if (n.hl > MAX_HL || n.l2 > MAX_L2) return false;   // the eval's stack buffers are sized by these caps
+    // Only the shape the eval code is written for loads (a self-consistent file of another shape
+    // would otherwise load "successfully" and then index out of range or divide by zero):
+    //   input buckets == the king-bucket count of BUCKET_LAYOUT (king_bucket() returns 0..9),
+    //   hl a multiple of 64 up to MAX_HL (the accumulator and pairwise SIMD loops; stack buffers),
+    //   l2 a multiple of 16 up to MAX_L2 (the int8 dot loops step 16; stack buffers),
+    //   1..32 output buckets (output_bucket() divides the 32 men by the count).
+    // The bounds also keep every array size below in 32 bits. Header fields are unsigned, so a
+    // huge value turns negative here and fails the lower bounds.
+    if (n.input_buckets != kKingBuckets || n.hl < 64 || n.hl > MAX_HL || n.hl % 64 != 0 ||
+        n.l2 < 16 || n.l2 > MAX_L2 || n.l2 % 16 != 0 || n.out_buckets < 1 || n.out_buckets > 32)
+        return false;
     const std::uint32_t HL = hdr[1], IB = hdr[2], L2 = hdr[3], OB = hdr[4];
     n.base_dims = 768ull * IB;
     n.total_inputs = n.base_dims + THREAT_DIMS + PP_DIMS;
@@ -717,6 +728,10 @@ void gather(const Board& board, std::size_t base, AddStm add_stm, AddNtm add_ntm
 // make/unmake so the base sum isn't rebuilt every eval. Only the base block is
 // incremental (Stage A); threats+pp are still recomputed in eval_quant.
 constexpr int ACC_STACK = MAX_PLY + 8;
+// The search never makes a move from a node at ply >= MAX_PLY (both negamax and qsearch return
+// first), so the stack index peaks at MAX_PLY and the overflow branch in acc_make (which drops
+// to full recompute for the rest of the iteration) is unreachable. Keep it that way.
+static_assert(ACC_STACK > MAX_PLY + 1, "accumulator stack must cover every search ply");
 struct Acc {
     alignas(64) std::int16_t v[2][MAX_HL];  // v[0]=WHITE perspective, v[1]=BLACK perspective
 };
@@ -1790,17 +1805,6 @@ Value eval_quant_t(const Board& board) {
             x1[o] = screlu(static_cast<float>(vaddvq_s32(acc4)) / DEQ + n.l1b[b * L2 + o]);
         }
     }
-#elif defined(__ARM_FEATURE_DOTPROD)
-    // Dense int8 sdot. NNZ sparse (input-major over nonzero h8) was tried and lost
-    // hard on NEON (-20%): vdotq packs 16 MACs + reduction per op, so the ~76% h8
-    // sparsity can't beat it (see NNUE_SPEED_TODO_2.md item 6).
-    for (int o = 0; o < L2; ++o) {
-        const std::int8_t* w = wbucket + static_cast<std::size_t>(o) * hl;
-        int32x4_t acc4 = vdupq_n_s32(0);
-        for (int i = 0; i < hl; i += 16)
-            acc4 = vdotq_s32(acc4, vld1q_s8(h8 + i), vld1q_s8(w + i));
-        x1[o] = screlu(static_cast<float>(vaddvq_s32(acc4)) / DEQ + n.l1b[b * L2 + o]);
-    }
 #elif defined(__AVX2__)
     // AVX2 counterpart of the sdot path. h8 is in [0,QA]=[0,127], i.e. a valid UNSIGNED
     // byte, and l1w_dot is signed int8: VPMADDUBSW (u8*s8, adjacent pairs summed into
@@ -2028,10 +2032,13 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
             // Item #9: count only threats the MOVER gains on a higher-valued victim. piece-type bits
             // (1=pawn..5=queen) are ordered by value, so the comparison needs no table; the colour
             // bit (8) selects the mover's own attackers, so a threat created AGAINST the mover does
-            // not inflate the count.
-            if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++g_threats_made;
+            // not inflate the count. Only pairs that are threat features count (attacks on a king
+            // and the other excluded pairs map past THREAT_DIMS).
             const std::uint32_t s = make_threat_index(a_sf, a_sq ^ wo, t_sq ^ wo, attacked);
-            if (s < (std::uint32_t)THREAT_DIMS) push(0, s, add);
+            if (s < (std::uint32_t)THREAT_DIMS) {
+                if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++g_threats_made;
+                push(0, s, add);
+            }
             const std::uint32_t nn = make_threat_index(a_sf ^ 8, a_sq ^ bo, t_sq ^ bo, attacked ^ 8);
             if (nn < (std::uint32_t)THREAT_DIMS) push(1, nn, add);
         };
@@ -2226,6 +2233,8 @@ void acc_make(const Board& before, Move m) {
 }
 
 void acc_unmake() { if (g_ply > 0) g_ply--; }
+
+void acc_clear() { g_ply = -1; }
 
 // Accumulator units read by acc_delta_l1: a CONTIGUOUS PREFIX of each perspective, not all of them.
 // The full 1024-unit norm measured -3.395% nps with the tree held identical

@@ -41,6 +41,7 @@ class UCI {
     void handle_position(std::istringstream& is);
     void handle_go(std::istringstream& is);
     void handle_gengame(std::istringstream& is);  // in-engine self-play game generation
+    void handle_revgame(std::istringstream& is);  // in-engine reverse-analysis labelling of one game
     void handle_perft(std::istringstream& is);    // debug: bulk-counted perft of the current position
     void handle_print() const;
 

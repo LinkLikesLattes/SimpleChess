@@ -72,7 +72,7 @@ make clean
 For the fastest (shipping) binary, use the profile-guided build:
 
 ```sh
-make profile-build PGO_NET=nets/SCNNUEv3-2026-09-26.scn5
+make profile-build PGO_NET=nets/SCNNUEv3-2026-10-03.scn5
 ```
 
 The release build uses `-O3 -flto -mcpu=native`; retarget the architecture with,
@@ -82,7 +82,7 @@ any AVX2 machine (Haswell or newer) use `make ARCH="-march=x86-64-v3"`.
 `profile-build` additionally needs Python 3 with
 [python-chess](https://pypi.org/project/chess/) (`pip install chess`) for its
 training workload. A `CMakeLists.txt` is provided for IDE / CMake users.
-`make EMBED_NET=nets/SCNNUEv3-2026-09-26.scn5` bakes the network into the executable
+`make EMBED_NET=nets/SCNNUEv3-2026-10-03.scn5` bakes the network into the executable
 for a single-file deployment; a newer net beside the binary still takes precedence.
 
 **Android (arm64).** The repository's GitHub Actions workflow
@@ -140,12 +140,12 @@ search score, not rescaled.
 
 ## The network
 
-`nets/SCNNUEv3-2026-09-26.scn5` is the pre-quantized int8 playing network (file
+`nets/SCNNUEv3-2026-10-03.scn5` is the pre-quantized int8 playing network (file
 magic `SCN5`), committed to the repo so the engine works immediately after a
 clone or "Download ZIP." Nets are named `SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5`
 (engine major + export date) and the engine loads the newest one it finds; the
 repo always ships only the latest network — older nets are available from older
-releases. It is trained on 2.34 billion positions from the engine's own self-play;
+releases. It is trained on 3.17 billion positions from the engine's own self-play;
 the trainer and training data are developed separately and are not part of this
 repository.
 

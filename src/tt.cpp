@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 // D1: back the transposition table with 2 MB large pages when the OS allows it. Large
 // pages cut TLB misses on the table's random-access probes; the stored bytes and every
@@ -70,11 +71,12 @@ constexpr int AGE_PENALTY = 8;
 constexpr int PV_HOLD     = 4;
 constexpr int GEN_CYCLE   = 32;
 
-// Mate scores are stored distance-to-mate from the *root*: normalise on write.
-// (search.cpp holds the matching read-side conversion.)
+// Mate and tablebase scores (the band from VALUE_TB_WIN_IN_MAX_PLY up) are stored as the distance
+// from the stored node, not the root: normalise on write. (search.cpp holds the matching
+// read-side conversion.)
 Value value_to_tt(Value v, int ply) {
-    if (v >= VALUE_MATE_IN_MAX_PLY) return v + ply;
-    if (v <= VALUE_MATED_IN_MAX_PLY) return v - ply;
+    if (v >= VALUE_TB_WIN_IN_MAX_PLY) return v + ply;
+    if (v <= VALUE_TB_LOSS_IN_MAX_PLY) return v - ply;
     return v;
 }
 
@@ -99,30 +101,31 @@ void TranspositionTable::release() noexcept {
     cluster_count_ = 0;
 }
 
-void TranspositionTable::resize(std::size_t mb) {
+std::size_t TranspositionTable::resize(std::size_t mb) {
     release();
-    const std::size_t bytes = mb * 1024 * 1024;
-    cluster_count_          = bytes / sizeof(Cluster);
-    if (cluster_count_ < 1) cluster_count_ = 1;
-
-    // Cache-line-aligned so no cluster straddles a line; raw allocation (entries
-    // are trivial and made valid by the zero-fill in clear()).
+    // Allocate before publishing the size, and step down on failure: a failed allocation must
+    // never leave a cluster count over a null table, nor escape as an uncaught bad_alloc. At
+    // 1 MB the plain throwing allocation is the last resort (out of memory entirely).
+    // Cache-line-aligned so no cluster straddles a line; raw allocation (entries are trivial
+    // and made valid by the zero-fill in clear()).
+    for (mb = std::max<std::size_t>(1, mb);; mb /= 2) {
+        const std::size_t count = std::max<std::size_t>(1, mb * 1024 * 1024 / sizeof(Cluster));
+        const std::size_t need  = count * sizeof(Cluster);
+        void*             p     = nullptr;
 #if defined(_WIN32)
-    const std::size_t need = cluster_count_ * sizeof(Cluster);
-    void* lp = sc_large_alloc(need, &alloc_bytes_);
-    if (lp) {
-        clusters_    = static_cast<Cluster*>(lp);   // MEM_COMMIT zero-fills; clear() re-zeros
-        large_pages_ = true;
-    } else {
-        clusters_    = static_cast<Cluster*>(
-            ::operator new(cluster_count_ * sizeof(Cluster), std::align_val_t{64}));
-        large_pages_ = false;
-    }
-#else
-    clusters_ = static_cast<Cluster*>(
-        ::operator new(cluster_count_ * sizeof(Cluster), std::align_val_t{64}));
+        p            = sc_large_alloc(need, &alloc_bytes_);   // MEM_COMMIT zero-fills; clear() re-zeros
+        large_pages_ = p != nullptr;
 #endif
-    clear();
+        if (!p)
+            p = mb > 1 ? ::operator new(need, std::align_val_t{64}, std::nothrow)
+                       : ::operator new(need, std::align_val_t{64});
+        if (p) {
+            clusters_      = static_cast<Cluster*>(p);
+            cluster_count_ = count;
+            clear();
+            return mb;
+        }
+    }
 }
 
 void TranspositionTable::clear() {

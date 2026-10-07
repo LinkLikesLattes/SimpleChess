@@ -68,8 +68,9 @@ class TranspositionTable {
     ~TranspositionTable() { release(); }
 
     // (Re)allocate to `mb` megabytes. Uses the whole allocation (no power-of-two
-    // rounding). Clears all entries. Called on `setoption Hash` and startup.
-    void resize(std::size_t mb);
+    // rounding). Clears all entries. Called on `setoption Hash` and startup. If the
+    // memory is not available, halves the size until it is; returns the MB in use.
+    std::size_t resize(std::size_t mb);
 
     // Zero every entry. Called on `ucinewgame`.
     void clear();

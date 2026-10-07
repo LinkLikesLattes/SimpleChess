@@ -149,18 +149,32 @@
 #endif
 // 50-move-rule mate reclassification: a mate score read back from the transposition table is only
 // real if the mating side can actually deliver it before the 50-move draw resets the game. When the
-// reported distance to mate exceeds the plies the halfmove clock still allows (100 - clock), the mate
-// is unreachable, so downgrade it to a high but non-mate score (VALUE_TB_WIN_IN_MAX_PLY - 1) -- the
-// search keeps treating the position as winning but stops trusting, extending, and reporting a forced
-// mate it cannot force. Scoped strictly to the mate band (>= VALUE_MATE_IN_MAX_PLY): tablebase-band
-// scores are never cached in the TT here (the WDL probe returns before the store), so they cannot
-// reach this path and are intentionally left untouched. Shipped on by default as a correctness fix:
+// distance to mate from the probing node exceeds the plies the halfmove clock still allows
+// (100 - clock), the mate is unreachable, so downgrade it to a high but non-mate score
+// (VALUE_TB_WIN_IN_MAX_PLY - 1) -- the search keeps treating the position as winning but stops
+// trusting, extending, and reporting a forced mate it cannot force. Tablebase-band scores get the
+// same test against the distance to the zeroing position the probe was made at (the probe itself
+// is never cached, but the parents that back the score up are). Shipped on by default as a correctness fix:
 // SPRT was neutral at fast TC (+1 [-3,+5], LOS 69%, no regression over 3000 pairs) because the node
 // cost of surrendering false-mate cutoffs cancels the benefit there, but the engine no longer reports
 // or chases a mate the 50-move rule voids, and the payoff is a long-TC/endgame property the fast test
 // cannot see. Set to 0 to restore the plain ply de-shift.
 #ifndef SC_R50MATE
 #define SC_R50MATE 1
+#endif
+// 3.5 bug-hunt search fixes that change the tree in ordinary positions. Shipped on: no-regression
+// SPRT of the three together vs 3.4.0 (10+0.1, bounds [-3,+1]) PASSED, +11 Elo [+3,+19] over 943
+// pairs, LLR +2.98. Set one to 0 to restore the old behaviour.
+// SC_EVAL_SLOT (S6): razoring's qsearch and the singular verification search run on the node's
+//   own stack slot and overwrite static_eval; put the corrected value back afterwards.
+// SC_TREE_REP (S7, L1): a position that already occurred inside the search tree is a draw on its
+//   first recurrence (pre-root history still needs a threefold), and the scan stops at a null move.
+// SC_QS_PROMO (M1, movepick.hpp): qsearch also generates non-capturing queen promotions.
+#ifndef SC_EVAL_SLOT
+#define SC_EVAL_SLOT 1
+#endif
+#ifndef SC_TREE_REP
+#define SC_TREE_REP 1
 #endif
 #include "types.hpp"
 
@@ -197,6 +211,7 @@ struct Stack {
     int   moved_to     = 0;                    // destination square of current_move
     Value static_eval  = VALUE_NONE;           // static eval at this node (NONE in check)
     int   ply          = 0;
+    Key   key          = 0;                    // position key at this node (repetition scan)
 };
 
 // One legal root move and what the current search knows about it (MultiPV, 3.3).
@@ -295,6 +310,7 @@ class Worker {
     std::vector<RootMove> root_moves_;
     int                   pv_idx_  = 0;
     int                   multipv_ = 1;
+    bool                  root_restricted_ = false;  // `go searchmoves` narrowed the root
 
     // Snapshot of the pool's search width, taken once per ID iteration so the
     // widening is stable within an iteration.
@@ -391,7 +407,8 @@ class Search {
     Board        root_;
     SearchLimits limits_;
     TimeBudget   budget_;
-    TimePoint    start_time_;
+    // Written by the UCI thread at start and at ponderhit while the main worker reads it.
+    std::atomic<TimePoint> start_time_{};
 };
 
 }  // namespace engine

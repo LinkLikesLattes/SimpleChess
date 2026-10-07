@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 #include "types.hpp"
 
@@ -25,8 +26,9 @@ using TimePoint = std::chrono::steady_clock::time_point;
 }
 
 // The parsed contents of a UCI `go` command. Milliseconds throughout; a value of
-// 0 for a clock field means "not provided". `movetime`/`depth`/`nodes` of 0 and
-// `infinite == false` means "use the clock-based budget".
+// 0 for any field means "not provided". A given clock (wtime/btime or movetime)
+// always applies; depth, nodes and mate stop the search on top of it, whichever
+// comes first. `go` with no limit at all is parsed as `infinite`.
 struct SearchLimits {
     std::int64_t time[2]    = {0, 0};  // remaining time for [WHITE], [BLACK]
     std::int64_t inc[2]     = {0, 0};  // increment for [WHITE], [BLACK]
@@ -39,10 +41,7 @@ struct SearchLimits {
     bool         ponder     = false;   // pondering (search on opponent's time)
     int          move_overhead_ms = 30; // UCI `Move Overhead`: per-move reserve for GUI/network lag
     int          multipv    = 1;       // UCI `MultiPV`: principal variations to report (analysis)
-
-    [[nodiscard]] bool uses_time_control() const noexcept {
-        return !infinite && depth == 0 && nodes == 0 && movetime == 0 && mate == 0;
-    }
+    std::vector<Move> searchmoves;     // `searchmoves`: restrict the root to these (empty = all)
 };
 
 // A concrete budget for one search, derived from SearchLimits at `go` time.

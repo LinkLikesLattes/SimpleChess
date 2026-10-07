@@ -41,6 +41,7 @@
 #include "nnue.hpp"
 #include "see.hpp"
 #include "syzygy.hpp"
+#include "io.hpp"
 #include "wdl.hpp"
 
 namespace engine {
@@ -124,8 +125,9 @@ void set_root_noise(int cp) { g_root_noise.store(cp < 0 ? 0 : cp, std::memory_or
 
 void set_show_wdl(bool on) { g_show_wdl.store(on, std::memory_order_relaxed); }
 
-// Set before any gengame search on the UCI thread; worker threads (created in
-// start()) observe it via the thread-creation happens-before. Not changed mid-search.
+// Set on the UCI thread before gengame/revgame's searches; the workers observe it through
+// start()'s hand-off (thread creation, or the persistent pool's mutex). Those callers stop and
+// join any running search first, so the flag never changes while a search is live.
 void set_gen_silent(bool silent) { g_gen_silent = silent; }
 
 namespace {
@@ -239,22 +241,55 @@ const auto kLmr = [] {
     return t;
 }();
 
-// Convert a TT-stored (root-relative) mate score back to node-relative at `ply`. `r50c` is the
-// position's halfmove clock; with SC_R50MATE it downgrades a mate the 50-move rule voids before it
-// can be delivered (see the switch comment in search.hpp). r50c is unused when the switch is off.
+// Convert a TT-stored mate or tablebase score (distance counted from the stored node) back to the
+// root-relative form the search uses at `ply`. `r50c` is the position's halfmove clock; with
+// SC_R50MATE it downgrades a result the 50-move rule voids before it can be reached (see the switch
+// comment in search.hpp): the stored value alone gives the distance from this node -- to the mate,
+// or to the zeroing position whose probe gave the TB result -- so the result is unreachable when
+// that distance exceeds 100 - r50c. r50c is unused when the switch is off.
 [[nodiscard]] Value tt_value_from(std::int16_t stored, int ply, [[maybe_unused]] int r50c) noexcept {
     Value v = stored;
-    if (v >= VALUE_MATE_IN_MAX_PLY) {
-        if constexpr (SC_R50MATE)
-            if (VALUE_MATE - (v - ply) > 100 - r50c) return VALUE_TB_WIN_IN_MAX_PLY - 1;
+    if (v >= VALUE_TB_WIN_IN_MAX_PLY) {
+        if constexpr (SC_R50MATE) {
+            const int dist = v >= VALUE_MATE_IN_MAX_PLY ? VALUE_MATE - v : VALUE_TB - v;
+            if (dist > 100 - r50c) return VALUE_TB_WIN_IN_MAX_PLY - 1;
+        }
         return v - ply;
     }
-    if (v <= VALUE_MATED_IN_MAX_PLY) {
-        if constexpr (SC_R50MATE)
-            if (VALUE_MATE + (v + ply) > 100 - r50c) return VALUE_TB_LOSS_IN_MAX_PLY + 1;
+    if (v <= VALUE_TB_LOSS_IN_MAX_PLY) {
+        if constexpr (SC_R50MATE) {
+            const int dist = v <= VALUE_MATED_IN_MAX_PLY ? VALUE_MATE + v : VALUE_TB + v;
+            if (dist > 100 - r50c) return VALUE_TB_LOSS_IN_MAX_PLY + 1;
+        }
         return v + ply;
     }
     return v;
+}
+
+// Repetition draw. With SC_TREE_REP off: a genuine threefold (two prior occurrences) anywhere.
+// With it on: a position that already occurred inside the search tree (at or after the root) is
+// a draw on its first recurrence: the side that could have deviated chose to repeat, so
+// the cycle can be forced. A position whose earlier occurrences are only in the game history
+// before the root still needs a genuine threefold (two prior occurrences): a single pre-root
+// repeat is not a forced draw, the winning side just declines it, and scoring it 0.00 made a
+// losing engine shuffle toward a "draw" it couldn't hold. The in-tree scan stops at a null move:
+// a cycle through a pass is not a repetition, and no position before the pass can count.
+[[nodiscard]] bool is_repetition_draw(const Board& board, [[maybe_unused]] const Stack* ss) noexcept {
+    if constexpr (!SC_TREE_REP) return board.isRepetition(2);  // switch off: threefold everywhere
+    const Key key   = board.hash();
+    const int limit = std::min(ss->ply, static_cast<int>(board.halfMoveClock()));
+    for (int k = 1; k <= limit; ++k) {
+        if ((ss - k)->current_move == Move(Move::NULL_MOVE)) return false;
+        if (k % 2 == 0 && (ss - k)->key == key) return true;
+    }
+    return board.isRepetition(2);
+}
+
+// A node whose halfmove clock has reached 100 is a 50-move draw, unless the move that reached it
+// gave checkmate: mate takes precedence over the 50-move rule, so that node is mated.
+[[nodiscard]] Value fifty_move_value(const Board& board, int ply) noexcept {
+    if (board.inCheck() && !chess::movegen::anylegalmoves(board)) return mated_in(ply);
+    return VALUE_DRAW;
 }
 
 [[nodiscard]] bool bound_covers(Bound b, Value v, Value threshold) noexcept {
@@ -312,7 +347,7 @@ void Search::start(const Board& root, const SearchLimits& limits) {
     const int game_ply = 2 * (static_cast<int>(root.fullMoveNumber()) - 1) +
                          (root.sideToMove() == Color::BLACK ? 1 : 0);
     budget_     = compute_budget(limits, root.sideToMove(), game_ply);
-    start_time_ = now();
+    start_time_.store(now(), std::memory_order_relaxed);  // published by the release stores below
 
     for (auto& w : workers_) w->new_search();
     tt_.new_search();
@@ -343,8 +378,12 @@ void Search::ponderhit() {
     // starts now, so reset the reference point: the move budget is measured from
     // ponderhit, giving a full allocation of clean, completed iterations (the
     // warm TT from pondering carries over, so it starts deep). Set the time
-    // before clearing the flag so a racing should_stop() never sees the old one.
-    start_time_ = now();
+    // before clearing the flag (release; readers load the flag with acquire) so
+    // a racing should_stop() never sees the old one. A ponderhit that arrives
+    // when no ponder search is running changes nothing: resetting a normal
+    // search's clock would make it overspend.
+    if (!pondering_.load(std::memory_order_acquire)) return;
+    start_time_.store(now(), std::memory_order_relaxed);
     pondering_.store(false, std::memory_order_release);
 }
 
@@ -439,8 +478,8 @@ bool Worker::should_stop() {
             pool_.stop_.store(true, std::memory_order_relaxed);
             return true;
         }
-        if (pool_.budget_.use_clock && !pool_.pondering_.load(std::memory_order_relaxed) &&
-            elapsed_ms(pool_.start_time_) >= pool_.budget_.hard_ms) {
+        if (pool_.budget_.use_clock && !pool_.pondering_.load(std::memory_order_acquire) &&
+            elapsed_ms(pool_.start_time_.load(std::memory_order_relaxed)) >= pool_.budget_.hard_ms) {
             pool_.stop_.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -457,10 +496,9 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
 
     if (should_stop()) return VALUE_ZERO;
 
-    // Require a true threefold (isRepetition(2) == two prior occurrences); see
-    // the note at the equivalent check in search().
-    if (board.isRepetition(2) || board.isHalfMoveDraw() || board.isInsufficientMaterial())
-        return VALUE_DRAW;
+    ss->key = board.hash();
+    if (is_repetition_draw(board, ss) || board.isInsufficientMaterial()) return VALUE_DRAW;
+    if (board.isHalfMoveDraw()) return fifty_move_value(board, ss->ply);
 
     const bool in_check = board.inCheck();
     if (ss->ply >= MAX_PLY) return in_check ? VALUE_DRAW : nnue::evaluate(board);
@@ -614,16 +652,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
 
     if (should_stop()) return VALUE_ZERO;
 
+    ss->key = board.hash();
     if (!root) {
-        // Threefold, not a single repeat. isRepetition(1) treated ANY 2-fold as
-        // a draw, including one whose earlier occurrence is in pre-root GAME
-        // history — which is not a forced draw: the winning side just declines
-        // it. That made a losing engine score such a line 0.00 and shuffle
-        // toward a "forced draw" it couldn't hold; the moment the opponent
-        // stepped out of the repetition the eval fell back to losing. Requiring
-        // a genuine threefold (two prior occurrences) removes the phantom draw.
-        if (board.isRepetition(2) || board.isHalfMoveDraw() || board.isInsufficientMaterial())
-            return VALUE_DRAW;
+        if (is_repetition_draw(board, ss) || board.isInsufficientMaterial()) return VALUE_DRAW;
+        if (board.isHalfMoveDraw()) return fifty_move_value(board, ss->ply);
         if (ss->ply >= MAX_PLY) return board.inCheck() ? VALUE_DRAW : nnue::evaluate(board);
 
         // Mate distance pruning: the window can't contain mates longer than
@@ -716,6 +748,9 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     } else {
         ss->static_eval = VALUE_NONE;
     }
+    // Razoring's qsearch and the singular verification search run on this same stack slot;
+    // both put this value back afterwards.
+    [[maybe_unused]] const Value eval_slot = ss->static_eval;
 
     // Is the static eval better than two plies ago? Loosens pruning when our
     // position is trending up, tightens it when trending down.
@@ -794,7 +829,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             if constexpr (SC_PASSEVAL)
                 if (pass_[PASS_RAZOR] > 0) need_tension();
             if (eval + kRazorMargin * depth + (SC_PASSEVAL ? tn * pass_[PASS_RAZOR] / 16 : 0) < alpha) {
+                // qsearch runs on this node's own stack slot and overwrites static_eval
+                // with its raw eval; restore the corrected one the rest of the node reads.
                 const Value v = qsearch(board, ss, alpha - 1, alpha);
+                if constexpr (SC_EVAL_SLOT) ss->static_eval = eval_slot;
                 if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
                 if (v < alpha && !is_mate_score(v)) return v;
             }
@@ -946,6 +984,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 if (root_moves_[static_cast<std::size_t>(k)].move == m) { searched = true; break; }
             if (searched) continue;
         }
+        // `go searchmoves`: the root searches only the listed moves.
+        if (root && root_restricted_ &&
+            std::find(root_moves_.begin(), root_moves_.end(), m) == root_moves_.end())
+            continue;
 
         const bool quiet       = is_quiet(board, m);
         const bool capture     = board.isCapture(m);
@@ -1015,6 +1057,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             ss->excluded  = m;
             const Value v = negamax(board, ss, sing_depth, sing_beta - 1, sing_beta, cut_node);
             ss->excluded  = Move(Move::NO_MOVE);
+            if constexpr (SC_EVAL_SLOT) ss->static_eval = eval_slot;  // the verification search reuses this slot
 
             if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
@@ -1352,13 +1395,35 @@ void Worker::think() {
 
     Board board = pool_.root_;  // search mutates via make/unmake, so work on a copy
 
+    // While pondering, the bestmove is held until ponderhit or stop: the GUI expects it only
+    // then, never while we're searching on its clock. `go infinite` is held the same way until
+    // `stop`: a trivial position can run the loop out to MAX_PLY in milliseconds, and infinite
+    // analysis must never answer unasked.
+    const auto hold_bestmove = [this] {
+        while ((pool_.pondering_.load(std::memory_order_acquire) || pool_.limits_.infinite) &&
+               !pool_.stop_.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+
     Movelist root_moves;
     chess::movegen::legalmoves(root_moves, board);
+    // `go searchmoves`: search only the listed moves (the UCI parser keeps legal ones only).
+    root_restricted_ = false;
+    if (const auto& only = pool_.limits_.searchmoves; !only.empty()) {
+        Movelist kept;
+        for (const auto& m : root_moves)
+            if (std::find(only.begin(), only.end(), m) != only.end()) kept.add(m);
+        if (!kept.empty() && kept.size() < root_moves.size()) {
+            root_moves       = kept;
+            root_restricted_ = true;
+        }
+    }
 
     if (root_moves.empty()) {
         // Mated or stalemated root: the protocol still expects a bestmove line.
         if (main_worker) {
-            if (!g_gen_silent) std::cout << "bestmove 0000" << std::endl;
+            hold_bestmove();
+            if (!g_gen_silent) sync_cout << "bestmove 0000" << sync_endl;
             best_move_ = Move(Move::NO_MOVE);  // signal terminal position to gengame
             pool_.stop_.store(true, std::memory_order_release);
             pool_.searching_.store(false, std::memory_order_release);
@@ -1543,13 +1608,17 @@ void Worker::think() {
                 pool_.width_.store(width, std::memory_order_relaxed);
                 // Log only meaningful shifts, not every wobble.
                 if (!g_gen_silent && ((width == 0) != (old == 0) || std::abs(width - old) >= 32))
-                    std::cout << "info string search width " << width << "/" << kBreadthMax
-                              << std::endl;
+                    sync_cout << "info string search width " << width << "/" << kBreadthMax
+                              << sync_endl;
             }
         }
 
         // ---- Between-iteration stop conditions (main worker only) ----
         if (pool_.limits_.nodes && pool_.total_nodes() >= pool_.limits_.nodes) break;
+        // `go mate N`: done once the best line mates within N moves.
+        if (pool_.limits_.mate > 0 && score >= VALUE_MATE_IN_MAX_PLY &&
+            VALUE_MATE - score <= 2 * pool_.limits_.mate - 1)
+            break;
 
         // Convergence stops — active even while pondering. Once a mate is proven
         // or only one move is legal, deeper search is pointless. Firing these
@@ -1577,7 +1646,7 @@ void Worker::think() {
         }
 
         // Time-based stops: only when the clock is actually ours (not pondering).
-        if (pool_.budget_.use_clock && !pool_.pondering_.load(std::memory_order_relaxed)) {
+        if (pool_.budget_.use_clock && !pool_.pondering_.load(std::memory_order_acquire)) {
             // Trim the soft budget when the best move is obvious. Only for a
             // real game clock, not a fixed `movetime` (there is no clock to
             // save, so we honor the full think).
@@ -1627,7 +1696,7 @@ void Worker::think() {
                 }
             }
 
-            if (elapsed_ms(pool_.start_time_) >= soft) break;
+            if (elapsed_ms(pool_.start_time_.load(std::memory_order_relaxed)) >= soft) break;
 
             // Equal-position depth cap (v1.6.1): in a real game, don't spend
             // clock searching past kGameDepthCap once the position is roughly
@@ -1643,12 +1712,9 @@ void Worker::think() {
 
     if (main_worker) {
         root_score_ = prev_score;  // final completed-iteration score (stm-relative), for gengame
-        // If the ID loop ended on its own while still pondering (e.g. a proven
-        // mate), hold the bestmove: the GUI expects it only after ponderhit or
-        // stop, never while we're searching on its clock.
-        while (pool_.pondering_.load(std::memory_order_acquire) &&
-               !pool_.stop_.load(std::memory_order_acquire))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // The ID loop can end on its own (a proven mate, MAX_PLY) while pondering or in
+        // `go infinite`: hold the bestmove until ponderhit / stop.
+        hold_bestmove();
 
         // A time-cut search can leave the ponder move (pv[0][1]) out of sync with
         // best_move_ — a stale 2nd move from a line we no longer play, which is
@@ -1667,10 +1733,10 @@ void Worker::think() {
 
         if (!g_gen_silent) {
             const bool c960 = pool_.root_.chess960();  // castling spelling follows the root's mode
-            std::cout << "bestmove " << chess::uci::moveToUci(best_move_, c960);
+            std::string line = "bestmove " + chess::uci::moveToUci(best_move_, c960);
             if (ponder_move_ != Move(Move::NO_MOVE))
-                std::cout << " ponder " << chess::uci::moveToUci(ponder_move_, c960);
-            std::cout << std::endl;
+                line += " ponder " + chess::uci::moveToUci(ponder_move_, c960);
+            sync_cout << line << sync_endl;
         }
 
         pool_.stop_.store(true, std::memory_order_release);
@@ -1685,7 +1751,7 @@ void Worker::think() {
 // whose search stopped on an aspiration bound carries lowerbound/upperbound.
 void Worker::report_multipv(Depth depth) {
     if (g_gen_silent) return;  // gengame: suppress per-iteration info lines
-    const std::int64_t  ms    = std::max<std::int64_t>(1, elapsed_ms(pool_.start_time_));
+    const std::int64_t  ms    = std::max<std::int64_t>(1, elapsed_ms(pool_.start_time_.load(std::memory_order_relaxed)));
     const std::uint64_t nodes = pool_.total_nodes();
     const std::uint64_t nps   = nodes * 1000ULL / static_cast<std::uint64_t>(ms);
     const bool          c960  = pool_.root_.chess960();
@@ -1742,7 +1808,7 @@ void Worker::report_multipv(Depth depth) {
             for (int k = 0; k < len; ++k) ss << ' ' << chess::uci::moveToUci(pv[k], c960);
         }
 
-        std::cout << ss.str() << std::endl;
+        sync_cout << ss.str() << sync_endl;
     }
 }
 

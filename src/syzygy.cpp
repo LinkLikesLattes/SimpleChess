@@ -87,8 +87,9 @@ std::optional<Value> probe_wdl(const Board& board, int ply) {
 
     g_hits.fetch_add(1, std::memory_order_relaxed);
     const bool  fifty = g_fifty_rule.load(std::memory_order_relaxed);
-    const Value win   = static_cast<Value>(VALUE_TB_WIN_IN_MAX_PLY - ply);
-    const Value loss  = static_cast<Value>(VALUE_TB_LOSS_IN_MAX_PLY + ply);
+    // Inside the TB band [VALUE_TB_WIN_IN_MAX_PLY, VALUE_TB] (types.hpp), ply-encoded like a mate.
+    const Value win   = static_cast<Value>(VALUE_TB - ply);
+    const Value loss  = static_cast<Value>(-VALUE_TB + ply);
     switch (TB_GET_WDL(res)) {
         case TB_WIN:          return win;
         case TB_LOSS:         return loss;

@@ -25,8 +25,8 @@ struct WdlPermille {
     int win, draw, loss;   // side to move, per mille, sum 1000
 };
 
-// Lowest decisive magnitude: tablebase wins reach down to VALUE_TB_WIN_IN_MAX_PLY - MAX_PLY, and
-// every mate score and 50-move-downgraded mate lies above it.
+// Lowest decisive magnitude: every mate and tablebase score, and the 50-move-downgraded value
+// VALUE_TB_WIN_IN_MAX_PLY - 1, lies above it (with a MAX_PLY margin below the TB band).
 inline constexpr Value kWdlDecisive = VALUE_TB_WIN_IN_MAX_PLY - MAX_PLY;
 
 // P1 N3 B3 R5 Q9 over both sides, kings excluded.

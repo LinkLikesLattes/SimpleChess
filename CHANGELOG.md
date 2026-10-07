@@ -4,6 +4,73 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.5.0 — 2026-10-06
+
+- Self-reports: `SimpleChess 3.5.0`
+- Source VERSION at save time: `3.5.0`
+
+### Strength
+
+Pentanomial SPRT at 10+0.1, one thread per engine, paired openings:
+
+| Comparison | Elo (95%) | Pairs |
+|---|---|---|
+| Code only: 3.5.0 vs 3.4.0, both on the new network | +11 [+3, +19] | 943 |
+| Network only: SCNNUEv3-2026-10-03 vs SCNNUEv3-2026-09-26, both on the 3.4.0 engine | +30 [+22, +39] | 914 |
+| Code + network: 3.5.0 vs the 3.4.0 release | +32 [+23, +41] | 817 |
+| 3.5.0 vs the 3.2.0 release | +58 [+46, +70] | 453 |
+
+### Search
+
+- A position repeated inside the search tree is now a draw on its first recurrence; a repetition of a
+  position from the game before the root still needs a threefold. The repetition scan stops at a null move.
+- Razoring's quiescence check and the singular-extension verification search no longer overwrite the
+  node's corrected static evaluation.
+- The quiescence search also tries non-capturing queen promotions.
+- 50-move rule: a checkmate delivered by the move that reaches the 100th halfmove is now scored as mate
+  (it was scored as a draw), and the 50-move test on mate scores from the transposition table measures the
+  distance from the probing node (it used the distance from the root, which downgraded reachable mates).
+- Tablebase scores are encoded inside the tablebase band and ply-normalised in the transposition table,
+  with the same 50-move reachability test as mates; the MultiPV guard now recognises tablebase losses.
+
+### UCI
+
+- `go infinite`, and a `go` with no limits at all, never send `bestmove` before `stop`, including from a
+  checkmated or stalemated position.
+- `go searchmoves` is supported. `go mate N` stops once a mate in N is found. A `depth`, `nodes` or
+  `movetime` of 0 or below is treated as 1 (it used to search without limit). A clock given together with
+  `depth`, `nodes` or `mate` now applies.
+- A malformed or out-of-range `setoption` value no longer crashes the engine: numeric values are clamped
+  to the advertised range and an unparseable value is ignored with an `info string`. `Hash` is capped at
+  4096 MB, and a failed allocation falls back to a smaller table.
+- Changing `SyzygyPath` during a search no longer crashes the engine.
+- `position` refuses a FEN with more than 16 men or 8 pawns a side, or a pawn on the first or last rank.
+- `ponderhit` no longer races the search clock, and a `ponderhit` outside a ponder search is ignored.
+  With `OwnBook` on, `go ponder` no longer answers from the book immediately.
+- Output from the search and the UCI threads no longer interleaves.
+
+### Time management
+
+- With little time left and a Move Overhead larger than the increment, the engine no longer drops to about
+  1 ms a move (this happened below 52 × Move Overhead: 1.56 s at the default 30 ms, 5.2 s at 100 ms).
+  Nothing changes when the increment is at least the Move Overhead.
+- With `movestogo`, the 10% per-move cap no longer applies (`movestogo 1` with 60 s used at most 6 s);
+  the 60-second per-move cap still does.
+
+### Startup and network loading
+
+- If the newest network file cannot be loaded, the engine falls back to the next-newest one. A long digit
+  run in a network file name no longer crashes startup.
+- The directory beside the binary is now found when the engine is started through `PATH`.
+- A network file of a different shape is refused instead of loading and then crashing.
+
+### Network: SCNNUEv3-2026-10-03
+
+`nets/SCNNUEv3-2026-10-03.scn5` replaces `SCNNUEv3-2026-09-26`. Same architecture; the training set grew
+from 2.34 billion to 3.17 billion positions (+35%): the generation-29 self-play sweep combined with the
+previous pool, one row per position with the newest label kept. 70 superbatches of ~100M positions,
+eval/result blend 0.8 → 0.7. The `UCI_ShowWDL` model is unchanged.
+
 ## v3.4.0 — 2026-09-27
 
 - Self-reports: `SimpleChess 3.4.0`

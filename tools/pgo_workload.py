@@ -11,7 +11,10 @@ sets) decides where the .profraw lands; this script just does the work.
 
 <net> must match the engine's expected format (threats engine -> SCN4 float / SCN5 int8).
 Weights are irrelevant to profiling (only the executed code paths matter), so a
-throwaway correctly-shaped net is fine when no trained net exists yet.
+throwaway correctly-shaped net is fine when no trained net exists yet. The engine
+cannot START without a discoverable .scn5, so with a .scn4 <net> the newest
+nets/*.scn5 also goes into the sandbox (startup only; the passes load <net> by
+EvalFile); with no .scn5 anywhere the workload stops with an error.
 """
 import sys, time, os, shutil, tempfile
 import chess, chess.engine
@@ -36,6 +39,12 @@ if not os.environ.get("PGO_NO_SANDBOX"):
     os.makedirs(os.path.join(SANDBOX, "nets"))
     sb_net = os.path.join(SANDBOX, "nets", os.path.basename(net))
     shutil.copy2(net, sb_net)
+    if not net.endswith(".scn5"):
+        import glob as _glob
+        boot = sorted(_glob.glob("nets/*.scn5"))
+        if not boot:
+            sys.exit("pgo_workload: a .scn4 PGO_NET needs a .scn5 in nets/ for the engine to start")
+        shutil.copy2(boot[-1], os.path.join(SANDBOX, "nets", os.path.basename(boot[-1])))
     engine_path, net = sb_exe, sb_net
 
 # Opening / kiwipete / quiet middlegame / R+P endgame / heavy-piece / tactical.

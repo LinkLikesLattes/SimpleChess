@@ -35,9 +35,7 @@ inline constexpr char kEngineBuildDate[] = SC_BUILD_DATE;
 inline constexpr char kEngineAuthor[] = "Sam Moore";
 
 // Reported in the UCI `id name` line — includes the version so that two
-// different builds are distinguishable by a GUI or a match runner. The "NNUE"
-// tag also keeps this fork distinct from the hand-crafted-eval SimpleChess in
-// gauntlets that run both side by side.
+// different builds are distinguishable by a GUI or a match runner.
 inline constexpr char kEngineName[] = "SimpleChess " SC_VERSION;
 
 }  // namespace engine
