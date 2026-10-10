@@ -51,20 +51,6 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 <sub>CCRL ratings as of 2026-10-10.</sub>
 
-SimpleChess 3.2.0 is estimated at **3529 Elo on the CCRL Blitz 2'+1" 1-CPU scale** (95% interval 3501 to 3557).
-It is an estimate, not a CCRL rating: CCRL has not yet tested 3.1 or 3.2. The number comes from a 464-game
-gauntlet against 29 engines with published CCRL ratings, from Stockfish 19 (3784) down to c4ke 3.0 (3303), each
-the exact CCRL-tested version and each held at its CCRL 1-CPU rating while 3.2's rating was fitted with BayesElo's
-model at its default settings, on CCRL's printed scale. SimpleChess scored +162 =133 -169 (49.2%) against an
-average opponent of 3533.
-
-Conditions: 120000 ms + 1000 ms per move on a wall clock; every engine at Threads 1 with 256 MB hash, fresh
-processes each game; one CPU core per game on an Intel i7-9700; ponder, opening books and tablebases off; no
-adjudication (games end only by mate, stalemate, repetition, the fifty-move rule, insufficient material, time or an
-illegal move); 16 games per opponent from the same 8 UHO 2024 (Unbalanced Human Openings) 8-move lines, each played
-with both colours. Full method, opponent versions, openings and per-opponent results are in the
-[changelog](CHANGELOG.md) under v3.2.0.
-
 ## Build
 
 The Makefile is the primary build path — no CMake required. Requires a C++20
