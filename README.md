@@ -44,6 +44,13 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 ## Strength
 
+| Version | CCRL Blitz | CCRL 40/15 |
+|---|---|---|
+| 3.5.0 | **3561** (±19, #84, 703 games) | Not yet tested |
+| 3.4 or earlier | Never tested | Never tested |
+
+<sub>CCRL ratings as of 2026-10-10.</sub>
+
 SimpleChess 3.2.0 is estimated at **3529 Elo on the CCRL Blitz 2'+1" 1-CPU scale** (95% interval 3501 to 3557).
 It is an estimate, not a CCRL rating: CCRL has not yet tested 3.1 or 3.2. The number comes from a 464-game
 gauntlet against 29 engines with published CCRL ratings, from Stockfish 19 (3784) down to c4ke 3.0 (3303), each
