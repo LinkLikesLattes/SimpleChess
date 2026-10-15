@@ -6,21 +6,21 @@
 
 <p align="center">A UCI chess engine in C++20 with a custom, self-play-trained neural-network evaluation.</p>
 
-<p align="center">
-  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess bullet rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.bullet.rating&label=bullet&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
-  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess blitz rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.blitz.rating&label=blitz&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
-  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess rapid rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.rapid.rating&label=rapid&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
-  <a href="https://lichess.org/@/SimpleChessNNUE"><img alt="Lichess Chess960 rating" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FSimpleChessNNUE&query=%24.perfs.chess960.rating&label=chess960&logo=lichess&logoColor=white&color=6f42c1&style=for-the-badge"></a>
-</p>
-<p align="center"><sub>Live ratings of the <a href="https://lichess.org/@/SimpleChessNNUE">SimpleChessNNUE</a> bot in Lichess's bot pool.</sub></p>
-
----
 
 SimpleChess pairs a modern, heavily-tuned alpha-beta search with a from-scratch
 NNUE evaluation trained entirely on the engine's own self-play. Board representation
 and legal move generation come from a vendored, header-only move-generation
 library. The engine has hand-tuned SIMD paths for both Apple Silicon (NEON) and
 x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
+
+## Strength
+
+| Version | CCRL Blitz | CCRL 40/15 |
+|---|---|---|
+| 3.5.0 | **3561** (±19, #84, 703 games) | Testing... |
+| 3.4 or earlier | Never tested | Never tested |
+
+<sub>CCRL ratings as of 2026-10-15.</sub>
 
 ## Features
 
@@ -41,15 +41,6 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
   `perft <depth>` (bulk-counted: each root move's count, then the total). Optional win/draw/loss
   chances in the info lines (`UCI_ShowWDL`).
 - Optional Polyglot opening book support — off by default; no book ships, bring your own.
-
-## Strength
-
-| Version | CCRL Blitz | CCRL 40/15 |
-|---|---|---|
-| 3.5.0 | **3561** (±19, #84, 703 games) | Not yet tested |
-| 3.4 or earlier | Never tested | Never tested |
-
-<sub>CCRL ratings as of 2026-10-10.</sub>
 
 ## Build
 
