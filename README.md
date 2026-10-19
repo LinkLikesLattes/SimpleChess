@@ -17,10 +17,11 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 | Version | CCRL Blitz | CCRL 40/15 |
 |---|---|---|
+| 3.6.0 1CPU | Not yet tested | Not yet tested |
 | 3.5.0 1CPU | **3563** (±16, #84, 927 games) | **3482** (±33, #89, 164 games, ongoing) |
 | 3.4 or earlier | Never tested | Never tested |
 
-<sub>CCRL ratings as of 2026-10-17.</sub>
+<sub>CCRL ratings as of 2026-10-19.</sub>
 
 ## Features
 
