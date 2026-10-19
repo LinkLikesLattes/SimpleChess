@@ -34,8 +34,17 @@
 #include <fstream>
 #include <istream>
 #include <streambuf>
+#include <memory>
 #include <new>
+#include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -157,18 +166,20 @@ std::uint64_t ray_attacks(int sq, std::uint64_t occ, const int (*deltas)[2], int
 constexpr int ROOK_DIRS[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 constexpr int BISHOP_DIRS[4][2] = {{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
 
-std::uint64_t knight_attacks(int sq) {
-    const int f0 = file_of(sq), r0 = rank_of(sq);
-    static const int d[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
+// Knight / king / pawn attack sets. The loop forms are constexpr and build lookup tables at
+// compile time; the hot paths read the tables (NPS 3.6 item T1). Same sets by construction.
+constexpr std::uint64_t knight_attacks_loop(int sq) {
+    const int f0 = sq & 7, r0 = sq >> 3;
+    constexpr int d[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
     std::uint64_t bb = 0;
-    for (auto& k : d) {
+    for (const auto& k : d) {
         const int f = f0 + k[0], r = r0 + k[1];
         if (f >= 0 && f < 8 && r >= 0 && r < 8) bb |= 1ull << (r * 8 + f);
     }
     return bb;
 }
-std::uint64_t king_attacks(int sq) {
-    const int f0 = file_of(sq), r0 = rank_of(sq);
+constexpr std::uint64_t king_attacks_loop(int sq) {
+    const int f0 = sq & 7, r0 = sq >> 3;
     std::uint64_t bb = 0;
     for (int df = -1; df <= 1; ++df)
         for (int dr = -1; dr <= 1; ++dr) {
@@ -178,8 +189,8 @@ std::uint64_t king_attacks(int sq) {
         }
     return bb;
 }
-std::uint64_t pawn_attacks(int color, int sq) {  // 0 = white (north), 1 = black
-    const int f0 = file_of(sq), r0 = rank_of(sq), dr = (color == 0) ? 1 : -1;
+constexpr std::uint64_t pawn_attacks_loop(int color, int sq) {  // 0 = white (north), 1 = black
+    const int f0 = sq & 7, r0 = sq >> 3, dr = (color == 0) ? 1 : -1;
     std::uint64_t bb = 0;
     for (int df = -1; df <= 1; df += 2) {
         const int f = f0 + df, r = r0 + dr;
@@ -187,6 +198,111 @@ std::uint64_t pawn_attacks(int color, int sq) {  // 0 = white (north), 1 = black
     }
     return bb;
 }
+// NPS 3.6 item S1: at load, reorder the hidden neurons so the ones that are usually zero after the
+// pairwise activation sit together, then run L1 as a sparse product over the nonzero 4-byte input
+// chunks (int8 dot-products of 4 inputs). Any neuron order gives the same integer L1 sums -> the
+// evaluation is bit-identical; the order only decides how many all-zero chunks can be skipped.
+#ifndef SC_NPS_S1
+#define SC_NPS_S1 1
+#endif
+// NPS 3.6 item P2: pairwise division by 127 without 32-bit multiplies. For x = a*b with a, b in
+// [0,127] (x <= 16129), floor(x/127) == (x + 1 + ((x + 1) >> 7)) >> 7 exactly (checked for every
+// x in [0, 16129]), so: vmla (1 + a*b, u16), vsra (+ >>7), vshrn (>>7, narrowed to u8). Same h8.
+#ifndef SC_NPS_P2
+#define SC_NPS_P2 1
+#endif
+// NPS 3.6 item K1: king-bucket crossings from cached piece-square sums. When the moving king
+// changes bucket (same mirror side), its own perspective needs every piece's base column under the
+// new bucket instead of the old one. Each (perspective, mirror, bucket) keeps the int16 sum of the
+// base columns of the pieces it last saw plus those pieces' bitboards; bringing a cache up to date
+// costs only the pieces that changed since. Then acc -= old bucket's sum, += new bucket's sum.
+// int16 sums wrap identically however they are grouped -> bit-identical.
+#ifndef SC_NPS_K1
+#define SC_NPS_K1 1
+#endif
+#ifndef SC_NPS_K1_MIN   // men on the board from which K1 is used: 16 on both machines (i7-9700 and, re-tuned
+#define SC_NPS_K1_MIN 16  // on net 10-15, the M1 Max: +0.43% over 20, 12 below 16)
+#endif
+#ifndef SC_NPS_A2
+#define SC_NPS_A2 1
+#endif
+// x86 FX: the float labeler path (SCN4 net: int32 fixed-point accumulator, float body) on AVX2 --
+// it ran the scalar fallbacks (the int8 play path had all the x86 work). Same integers in the
+// accumulator, the same per-element float ops, and the same per-output fma chain in L1.
+#ifndef SC_FX_AVX2
+#if defined(__AVX2__)
+#define SC_FX_AVX2 1
+#else
+#define SC_FX_AVX2 0
+#endif
+#endif
+// Mac FX (float labeler on NEON), both layout only -> bit-identical:
+//  FXB  bucket-major float L1 copy (l1w_bm, as x86 47303d3) for the NEON input-major L1: each bucket's
+//       64 KB contiguous instead of 128-byte rows at a 1 KB stride.
+//  FXS  one physical copy of the 147 MB fixed-point FT (l0w_fx) for all engine processes: the first
+//       process to load a float net writes it to a cache file in $TMPDIR (under an flock, renamed into
+//       place) and every process maps that file read-only and shared. Any failure keeps a private copy.
+//       Windows (default 1): a named pagefile-backed section instead (see fx_share_map). i7-9700,
+//       8-worker self-play at depth 9: +26% (private copies 505/498 pos/s, shared 634/627).
+// Mac, measured with tools/speed/fx8_bench.py (8 workers, depth 9, 240 superbook-p1 games per run, M1 Max):
+// FXB +2.37% / +4.53% (two sessions, 4 and 6 rounds), FXS on top of FXB +2.72% / +1.63%, both +5.16% / +6.24%.
+#ifndef SC_FX_L1BM_NEON
+#if defined(__ARM_NEON)
+#define SC_FX_L1BM_NEON 1
+#else
+#define SC_FX_L1BM_NEON 0
+#endif
+#endif
+// x86 FXZ: lazy float accumulator. acc_make records a ply's add/sub column lists instead of applying
+// them, and the first read of that ply (eval, a child that must apply its own delta, a null move)
+// applies them from the newest computed ancestor, one ply at a time -- the same src->dst int32 pass,
+// so the accumulator holds the same integers. A ply popped unread costs no column traffic (~18% of
+// float updates are never read; SC_LZSTAT on 12 depth-9 games).
+#ifndef SC_FX_LAZY
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_FX_LAZY 1
+#else
+#define SC_FX_LAZY 0
+#endif
+#endif
+constexpr int kFxPendCap = 96;
+// x86 FXP: the float eval's int32->float fill, pairwise product and the L1's nonzero masks in one
+// pass straight from the accumulator (the same per-element ops; no 4 KB float copy written and read
+// back), and an eval frame under one page (no Windows stack probe per eval).
+#ifndef SC_FX_FUSE
+#define SC_FX_FUSE 1
+#endif
+#if defined(__AVX2__) && SC_FX_AVX2 && SC_FX_FUSE
+#define SC_FXP 1
+#else
+#define SC_FXP 0
+#endif   // FXZ: columns per perspective a deferred ply can hold (more -> applied at once)
+#ifndef SC_FX_SHARE   // the Windows section and the macOS file mapping; not measured elsewhere
+#if defined(_WIN32) || defined(__APPLE__)
+#define SC_FX_SHARE 1
+#else
+#define SC_FX_SHARE 0
+#endif
+#endif
+#ifndef SC_NPS_SMALLCOLS   // fused_apply_src (AVX2): column-outer up to this many columns
+#define SC_NPS_SMALLCOLS 2
+#endif
+#ifndef SC_NPS_L3S   // L3 over the nonzero screlu outputs only: always on AVX2; NEON behind this switch
+#define SC_NPS_L3S 0
+#endif
+#ifndef SC_NPS_T1
+#define SC_NPS_T1 1
+#endif
+constexpr auto kKnightAtt = [] { std::array<std::uint64_t, 64> t{}; for (int s = 0; s < 64; ++s) t[s] = knight_attacks_loop(s); return t; }();
+constexpr auto kKingAtt   = [] { std::array<std::uint64_t, 64> t{}; for (int s = 0; s < 64; ++s) t[s] = king_attacks_loop(s); return t; }();
+constexpr auto kPawnAtt   = [] {
+    std::array<std::array<std::uint64_t, 64>, 2> t{};
+    for (int c = 0; c < 2; ++c) for (int s = 0; s < 64; ++s) t[c][s] = pawn_attacks_loop(c, s);
+    return t;
+}();
+inline std::uint64_t knight_attacks(int sq) { return SC_NPS_T1 ? kKnightAtt[sq] : knight_attacks_loop(sq); }
+inline std::uint64_t king_attacks(int sq) { return SC_NPS_T1 ? kKingAtt[sq] : king_attacks_loop(sq); }
+inline std::uint64_t pawn_attacks(int color, int sq) { return SC_NPS_T1 ? kPawnAtt[color][sq] : pawn_attacks_loop(color, sq); }
 std::uint64_t pseudo_attacks_type(int pt, int sq) {  // piece type 2..6 = N,B,R,Q,K
     switch (pt) {
         case 2: return knight_attacks(sq);
@@ -221,6 +337,10 @@ struct Tables {
     std::array<std::array<std::uint32_t, 64>, 16> offsets{};
     std::array<std::array<std::array<std::uint32_t, 2>, 16>, 16> lut1{};
     std::array<std::array<std::array<std::uint8_t, 64>, 64>, 16> lut2{};
+    // TI: per [piece][from] the attack set lut2 counts in, next to that square's offset (16 KB
+    // in all, against lut2's 64 KB): lut2[p][f][t] == popcount(att & ((1 << t) - 1)).
+    struct AttOff { std::uint64_t att; std::uint32_t off; std::uint32_t pad; };
+    std::array<std::array<AttOff, 64>, 16> ao{};
     std::array<std::uint64_t, 64> pawn_pair{};
     bool built = false;
 };
@@ -268,6 +388,7 @@ void build_tables() {
     for (int piece : all_pieces)
         for (int from = 0; from < 64; ++from) {
             const std::uint64_t attacks = pseudo_for_index(piece, from);
+            t.ao[piece][from] = {attacks, t.offsets[piece][from], 0};
             for (int to = 0; to < 64; ++to) {
                 const std::uint64_t mask = (to == 0) ? 0 : ((1ull << to) - 1);
                 t.lut2[piece][from][to] = static_cast<std::uint8_t>(popcount64(mask & attacks));
@@ -290,7 +411,21 @@ void build_tables() {
 
 // make_index on already-oriented squares / already-color-swapped pieces
 // (caller folds perspective). Returns THREAT_DIMS for excluded features.
+// x86 TI: the lut2 term computed (bzhi + popcnt on BMI2) from the 16 KB attack/offset table
+// instead of read from the 64 KB lut2, which does not fit the 32 KB L1d. Same integer.
+#ifndef SC_NPS_TI
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_NPS_TI 1
+#else
+#define SC_NPS_TI 0
+#endif
+#endif
 inline std::uint32_t make_threat_index(int attacker, int from, int to, int attacked) {
+    if constexpr (SC_NPS_TI) {
+        const Tables::AttOff& e = g_tab.ao[attacker][from];
+        return g_tab.lut1[attacker][attacked][from < to ? 1 : 0] + e.off
+             + static_cast<std::uint32_t>(__builtin_popcountll(e.att & ((1ull << to) - 1)));
+    }
     return g_tab.lut1[attacker][attacked][from < to ? 1 : 0]
          + g_tab.offsets[attacker][from]
          + g_tab.lut2[attacker][from][to];
@@ -348,17 +483,24 @@ struct Net {
     bool loaded = false;
     bool quant = false;  // false = SCN4 float, true = SCN5 quantised (int8 FT)
     int hl = 0, input_buckets = 0, l2 = 0, out_buckets = 0;
+    // Output bucket per piece count, set at load: its two divisions (the divisor comes from the
+    // header, so they are runtime idivs) once per count instead of on every eval.
+    std::array<std::uint8_t, 65> obucket{};
     std::size_t base_dims = 0, total_inputs = 0;
     std::vector<float> l0w, l0b, l1w, l1b, l2b, l3w, l3b;
     WVec<float> l2w;               // 64-B aligned (G3): finish_body reads 32-float rows
     WVec<float> l2w_bm;            // G2: bucket-major [(b*L2 + i)*32 + o] -- 4 KB contiguous per bucket
+    WVec<float> l1w_bm;            // FXB (float net, L2 = 32): bucket-major [(b*HL + i)*32 + o], 64 KB per bucket
     // quant path: int8 feature transformer + int8 L1 (body stays float);
     // int16 accumulator + int16 FT bias.
     WVec<std::int8_t> l0w_i8;      // 64-B aligned (G3): 512 B feature rows
     std::vector<std::int16_t> l0b_i;
     // float labeler path: fixed-point FT weights/bias (lround(w*FX_S)) for the
     // incremental int32 accumulator. Built at load for float (SCN4) nets.
-    std::vector<std::int32_t> l0w_fx, l0b_fx;
+    WVec<std::int32_t> l0w_fx;     // 147 MB int32 FT columns: 64-B aligned, large pages on Windows (as l0w_i8)
+    std::shared_ptr<const std::int32_t> l0w_fx_shared;   // FXS: the same columns in a shared read-only mapping
+    const std::int32_t* l0w_fx_p = nullptr;              // what the labeler reads: the mapping or l0w_fx
+    std::vector<std::int32_t> l0b_fx;
     std::vector<std::int8_t> l1w_i;
     // L1 weights transposed to [bucket*L2 + o][HL] (HL contiguous) for the sdot
     // dot-product path; built from l1w_i on load.
@@ -368,15 +510,182 @@ struct Net {
     // [bucket*32 + i]; per-layer global scale. Built from l2w/l3w on load (quant net).
     std::vector<std::int8_t> l2w_dot, l3w_dot;
     float l2_scale = 0.0f, l3_scale = 0.0f;
+    // S1: L1 weights by input chunk, [bucket][hl/4 chunks][L2 outputs][4 inputs], for the sparse
+    // L1 (one 128-byte block per nonzero chunk at L2 = 32). Built after the neuron permutation.
+    WVec<std::int8_t> l1w_sp;
 };
 Net g_net;
+
+// FXS: the fixed-point FT columns of a float net, from (or into) a cache file shared by every engine
+// process: $TMPDIR/simplechess-fx-<key>.i32, key = FNV-1a over the dimensions, the fixed-point shift and
+// the float weights' bits. Under an exclusive flock the first process converts the weights exactly as
+// the private path does, writes them to a temporary file and renames it into place; every process then
+// maps the file read-only and shared, so the page cache holds one copy for all of them. Returns null on
+// any failure (no TMPDIR, disk full, a short file): the caller builds its private copy instead.
+//
+// Windows: the first process publishes the columns in a named pagefile-backed section
+// (SEC_LARGE_PAGES when the lock-pages privilege allows), named by a hash of the int32 columns
+// themselves; the others open it under a named mutex and map it read-only only after a full memcmp
+// against their own conversion (a section from another build or layout is never used). Nothing
+// outlives the processes. SCNNUE_NOFXSHARE=1 disables it at run time on both (A/B on one binary);
+// SCNNUE_FXSHARE_LOG=1 prints which path was taken to stderr.
+std::shared_ptr<const std::int32_t> fx_share_map([[maybe_unused]] const std::vector<float>& l0w,
+                                                 [[maybe_unused]] std::size_t ti, [[maybe_unused]] std::size_t hl) {
+#if defined(_WIN32)
+    const std::size_t nw = ti * hl, bytes = nw * sizeof(std::int32_t);
+    if (l0w.size() != nw || nw == 0 || std::getenv("SCNNUE_NOFXSHARE")) return nullptr;
+    std::vector<std::int32_t> fx(nw);
+    for (std::size_t i = 0; i < nw; ++i)
+        fx[i] = static_cast<std::int32_t>(std::lround(double(l0w[i]) * FX_S));
+    std::uint64_t h = 1469598103934665603ull ^ bytes;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(fx.data());
+    for (std::size_t i = 0; i + 8 <= bytes; i += 8) {
+        std::uint64_t x;
+        std::memcpy(&x, b + i, 8);
+        h = (h ^ x) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    char name[96], mname[104];
+    std::snprintf(name, sizeof name, "Local\\SimpleChessFX_%016llx_%llu",
+                  static_cast<unsigned long long>(h), static_cast<unsigned long long>(bytes));
+    std::snprintf(mname, sizeof mname, "%s_m", name);
+    HANDLE mtx = CreateMutexA(nullptr, FALSE, mname);
+    if (!mtx) return nullptr;
+    const DWORD wr = WaitForSingleObject(mtx, 120000);
+    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) { CloseHandle(mtx); return nullptr; }
+    void* view = nullptr;
+    bool created = false, large = false;
+    HANDLE sec = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+    if (sec) {
+        view = MapViewOfFile(sec, FILE_MAP_READ | FILE_MAP_LARGE_PAGES, 0, 0, 0);
+        large = view != nullptr;
+        if (!view) view = MapViewOfFile(sec, FILE_MAP_READ, 0, 0, 0);
+        if (view && std::memcmp(view, fx.data(), bytes) != 0) { UnmapViewOfFile(view); view = nullptr; }
+    } else {
+        static const bool priv = sc_enable_lock_pages_nnue();
+        const std::size_t gran = GetLargePageMinimum();
+        if (priv && gran) {
+            const std::size_t r = (bytes + gran - 1) / gran * gran;
+            sec = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
+                                     static_cast<DWORD>(r >> 32), static_cast<DWORD>(r), name);
+            if (sec) {
+                view = MapViewOfFile(sec, FILE_MAP_WRITE | FILE_MAP_LARGE_PAGES, 0, 0, 0);
+                if (!view) view = MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 0);
+                if (!view) { CloseHandle(sec); sec = nullptr; }
+                large = view != nullptr;
+            }
+        }
+        if (!sec) {
+            sec = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                     static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), name);
+            if (sec) view = MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 0);
+        }
+        if (view) { std::memcpy(view, fx.data(), bytes); created = true; }
+    }
+    ReleaseMutex(mtx);
+    CloseHandle(mtx);
+    if (std::getenv("SCNNUE_FXSHARE_LOG"))
+        std::fprintf(stderr, "FXS: %s %s pages\n", view ? (created ? "created" : "opened") : "private",
+                     large ? "large" : "small");
+    if (!view) { if (sec) CloseHandle(sec); return nullptr; }
+    return std::shared_ptr<const std::int32_t>(static_cast<const std::int32_t*>(view),
+                                               [sec](const std::int32_t* v) { UnmapViewOfFile(v); CloseHandle(sec); });
+#else
+    const std::size_t nw = ti * hl, bytes = nw * sizeof(std::int32_t);
+    if (l0w.size() != nw || nw == 0 || std::getenv("SCNNUE_NOFXSHARE")) return nullptr;
+    std::uint64_t key = 1469598103934665603ull;
+    auto mix = [&key](std::uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    mix(ti); mix(hl); mix(FX_SHIFT);
+    for (float w : l0w) { std::uint32_t u; std::memcpy(&u, &w, 4); mix(u); }
+    const char* dir = std::getenv("TMPDIR");
+    std::string path = std::string(dir && *dir ? dir : "/tmp");
+    if (path.back() != '/') path += '/';
+    char name[48];
+    std::snprintf(name, sizeof(name), "simplechess-fx-%016llx.i32", static_cast<unsigned long long>(key));
+    path += name;
+
+    const int lfd = ::open((path + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (lfd < 0) return nullptr;
+    void* map = MAP_FAILED;
+    if (::flock(lfd, LOCK_EX) == 0) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        struct stat st{};
+        if (fd >= 0 && (::fstat(fd, &st) != 0 || static_cast<std::size_t>(st.st_size) != bytes)) {
+            ::close(fd);
+            fd = -1;
+        }
+        if (fd < 0) {   // first process for this net: convert and publish
+            std::vector<std::int32_t> fx(nw);
+            for (std::size_t i = 0; i < nw; ++i)
+                fx[i] = static_cast<std::int32_t>(std::lround(double(l0w[i]) * FX_S));
+            const std::string tmp = path + "." + std::to_string(::getpid()) + ".tmp";
+            const int wfd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            bool ok = wfd >= 0;
+            const char* src = reinterpret_cast<const char*>(fx.data());
+            for (std::size_t done = 0; ok && done < bytes;) {
+                const ssize_t w = ::write(wfd, src + done, bytes - done);
+                if (w <= 0) ok = false;
+                else done += static_cast<std::size_t>(w);
+            }
+            if (wfd >= 0 && ::close(wfd) != 0) ok = false;
+            if (ok && ::rename(tmp.c_str(), path.c_str()) == 0) fd = ::open(path.c_str(), O_RDONLY);
+            else ::unlink(tmp.c_str());
+        }
+        if (fd >= 0) {
+            map = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
+            ::close(fd);
+        }
+        ::flock(lfd, LOCK_UN);
+    }
+    ::close(lfd);
+    if (map == MAP_FAILED) return nullptr;
+    return std::shared_ptr<const std::int32_t>(static_cast<const std::int32_t*>(map),
+                                               [bytes](const std::int32_t* p) { ::munmap(const_cast<std::int32_t*>(p), bytes); });
+#endif
+}
 bool g_base_only = false;  // SCNNUE_BASEONLY profiling probe (skip threats+pp)
 bool g_no_accum = false;   // SCNNUE_NOACCUM profiling probe (enumerate, skip column adds)
 bool g_verify = false;     // SCNNUE_VERIFY: cross-check incremental base vs recompute
+unsigned g_net_gen = 0;    // bumped on every successful load (K1: Finny caches hold column sums)
 int g_squeeze = 0;         // SCNNUE_SQUEEZE=N: fold threat/pp columns into N (cache probe)
 bool g_no_update = false;  // SCNNUE_NOUPDATE: skip the threat/pp delta in acc_make (cost probe)
 bool g_no_finny = false;   // SCNNUE_NOFINNY: force king moves to full refresh (A/B the finny path)
 bool g_prefetch = true;    // SCNNUE_NOPREFETCH: disable FT-row prefetch in acc_make (A/B)
+// NPS 3.6 campaign item P1: prefetch EVERY cache line of a feature column the moment the
+// delta enumeration emits it (a 512-byte int8 column is four 128-byte lines on Apple
+// Silicon), instead of only the first line of each column after the enumeration ends.
+// A prefetch cannot change any value -> bit-identical.
+// x86 keeps the first-line form: on the i7-9700 it measured +2.15% faster than every line.
+#ifndef SC_NPS_P1
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_NPS_P1 0
+#else
+#define SC_NPS_P1 1
+#endif
+#endif
+// The prefetch stride: the cache line (128 bytes on Apple Silicon, 64 on x86).
+#if defined(__APPLE__) && defined(__aarch64__)
+constexpr std::size_t kCacheLine = 128;
+#else
+constexpr std::size_t kCacheLine = 64;
+#endif
+// Prefetch shape knobs (x86 tuning): the stride of the P1 form (0 = kCacheLine), and how many
+// lines per column the P1=0 form fetches after the enumeration (at that stride).
+#ifndef SC_NPS_PF_STRIDE
+#define SC_NPS_PF_STRIDE 0
+#endif
+#ifndef SC_NPS_PF_N   // x86: none at all (i7-9700: +0.40% over the first line, which beat every line)
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_NPS_PF_N 0
+#else
+#define SC_NPS_PF_N 1
+#endif
+#endif
+constexpr std::size_t kPfStride = SC_NPS_PF_STRIDE ? SC_NPS_PF_STRIDE : kCacheLine;
+// Locality hint of those column prefetches (3 = all levels / prefetcht0, 1 = L2 and out / prefetcht2).
+#ifndef SC_NPS_PF_LOC
+#define SC_NPS_PF_LOC 3
+#endif
 bool g_no_cols = false;    // SCNNUE_NOCOLS: skip apply_diff column ops (isolate enum vs column cost)
 bool g_direct = true;      // SCNNUE_NODIRECT: use the old collect+sort+merge-diff delta instead (A/B + fallback)
 bool g_l1dense = false;    // SCNNUE_L1DENSE: force the dense float L1 matvec (A/B vs NNZ sparse)
@@ -420,6 +729,10 @@ inline float screlu(float x) {
 
 }  // namespace
 
+namespace {
+void permute_neurons(Net& n);   // S1; defined after gather()
+}
+
 static bool load_stream(std::istream& f) {
 
     char magic[4];
@@ -445,13 +758,18 @@ static bool load_stream(std::istream& f) {
     //   input buckets == the king-bucket count of BUCKET_LAYOUT (king_bucket() returns 0..9),
     //   hl a multiple of 64 up to MAX_HL (the accumulator and pairwise SIMD loops; stack buffers),
     //   l2 a multiple of 16 up to MAX_L2 (the int8 dot loops step 16; stack buffers),
-    //   1..32 output buckets (output_bucket() divides the 32 men by the count).
+    //   1..32 output buckets (the output bucket divides the 32 men by the count).
     // The bounds also keep every array size below in 32 bits. Header fields are unsigned, so a
     // huge value turns negative here and fails the lower bounds.
     if (n.input_buckets != kKingBuckets || n.hl < 64 || n.hl > MAX_HL || n.hl % 64 != 0 ||
         n.l2 < 16 || n.l2 > MAX_L2 || n.l2 % 16 != 0 || n.out_buckets < 1 || n.out_buckets > 32)
         return false;
     const std::uint32_t HL = hdr[1], IB = hdr[2], L2 = hdr[3], OB = hdr[4];
+    {   // output bucket of each piece count: (men - 2) / ceil(32 / OB), clamped to [0, OB)
+        const int ob = n.out_buckets, divisor = (32 + ob - 1) / ob;
+        for (int men = 0; men < 65; ++men)
+            n.obucket[men] = static_cast<std::uint8_t>(std::clamp((men - 2) / divisor, 0, ob - 1));
+    }
     n.base_dims = 768ull * IB;
     n.total_inputs = n.base_dims + THREAT_DIMS + PP_DIMS;
     const std::uint32_t TI = static_cast<std::uint32_t>(n.total_inputs);
@@ -506,9 +824,13 @@ static bool load_stream(std::istream& f) {
                 n.l3w_dot[static_cast<std::size_t>(bkt) * 32 + i] = q8(n.l3w[static_cast<std::size_t>(i) * OB + bkt] * n.l3_scale);
     } else {  // float labeler: fixed-point FT weights/bias for the incremental accumulator
         const std::size_t NW = static_cast<std::size_t>(TI) * HL;
-        n.l0w_fx.resize(NW);
-        for (std::size_t i = 0; i < NW; ++i)
-            n.l0w_fx[i] = static_cast<std::int32_t>(std::lround(double(n.l0w[i]) * FX_S));
+        if constexpr (SC_FX_SHARE) n.l0w_fx_shared = fx_share_map(n.l0w, TI, HL);
+        if (!n.l0w_fx_shared) {
+            n.l0w_fx.resize(NW);
+            for (std::size_t i = 0; i < NW; ++i)
+                n.l0w_fx[i] = static_cast<std::int32_t>(std::lround(double(n.l0w[i]) * FX_S));
+        }
+        n.l0w_fx_p = n.l0w_fx_shared ? n.l0w_fx_shared.get() : n.l0w_fx.data();
         n.l0b_fx.resize(HL);
         for (std::uint32_t j = 0; j < HL; ++j)
             n.l0b_fx[j] = static_cast<std::int32_t>(std::lround(double(n.l0b[j]) * FX_S));
@@ -532,7 +854,19 @@ static bool load_stream(std::istream& f) {
             for (std::uint32_t o = 0; o < 32; ++o)
                 n.l2w_bm[(static_cast<std::size_t>(bkt) * L2 + i) * 32 + o] =
                     n.l2w[static_cast<std::size_t>(i) * (OB * 32) + bkt * 32 + o];
+    // Float-net L1 the same way (the AVX2 input-major L1 reads the 32 weights of one input: contiguous
+    // per bucket instead of rows at a 1 KB stride; same values, same fma order).
+    if ((SC_FX_AVX2 || SC_FX_L1BM_NEON) && !n.quant && L2 == 32) {
+        n.l1w_bm.resize(static_cast<std::size_t>(OB) * HL * 32);
+        for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
+            for (std::uint32_t i = 0; i < HL; ++i)
+                for (std::uint32_t o = 0; o < 32; ++o)
+                    n.l1w_bm[(static_cast<std::size_t>(bkt) * HL + i) * 32 + o] =
+                        n.l1w[static_cast<std::size_t>(i) * (OB * L2) + bkt * L2 + o];
+    }
     build_tables();
+    if constexpr (SC_NPS_S1)
+        if (n.quant) permute_neurons(n);
     g_base_only = std::getenv("SCNNUE_BASEONLY") != nullptr;
     g_no_accum = std::getenv("SCNNUE_NOACCUM") != nullptr;
     g_verify = std::getenv("SCNNUE_VERIFY") != nullptr;
@@ -546,6 +880,7 @@ static bool load_stream(std::istream& f) {
     g_i8body = std::getenv("SCNNUE_I8BODY") != nullptr;
     n.loaded = true;
     g_net = std::move(n);
+    ++g_net_gen;
     return true;
 }
 
@@ -723,6 +1058,73 @@ void gather(const Board& board, std::size_t base, AddStm add_stm, AddNtm add_ntm
 
 }  // gather
 
+// ---- S1: neuron permutation + sparse-L1 weight layout ---------------------------
+// Reorders the hidden neurons by how often their pairwise activation is zero (most often first),
+// measured over deterministic random games from the start position (160 plies, so later phases
+// count too), then lays L1 out by 4-input
+// chunk. A neuron j moves as a unit: its two accumulator halves (j, j + hl/2), its FT bias, its FT
+// weight in every feature row, and its L1 weight in both the side-to-move and the other block.
+// Every L1 sum is the same integer in any neuron order, so the evaluation is unchanged.
+void permute_neurons(Net& n) {
+    const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
+    const std::size_t TI = n.total_inputs;
+    const std::int8_t* l0 = n.l0w_i8.data();
+
+    std::vector<std::uint32_t> zeros(static_cast<std::size_t>(half), 0);
+    std::vector<std::int16_t> a_stm(static_cast<std::size_t>(hl)), a_ntm(static_cast<std::size_t>(hl));
+    std::uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    auto cr = [](int x) { return x < 0 ? 0 : (x > QA ? QA : x); };
+    for (int game = 0; game < 128; ++game) {
+        Board b;
+        for (int ply = 0; ply < 160; ++ply) {
+            if (ply >= 6) {
+                for (int j = 0; j < hl; ++j) a_stm[j] = a_ntm[j] = n.l0b_i[j];
+                gather(
+                    b, n.base_dims,
+                    [&](std::size_t f) { const std::int8_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a_stm[j] += w[j]; },
+                    [&](std::size_t f) { const std::int8_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a_ntm[j] += w[j]; });
+                for (int j = 0; j < half; ++j) {
+                    zeros[j] += (cr(a_stm[j]) * cr(a_stm[j + half]) / QA == 0);
+                    zeros[j] += (cr(a_ntm[j]) * cr(a_ntm[j + half]) / QA == 0);
+                }
+            }
+            Movelist ml;
+            chess::movegen::legalmoves(ml, b);
+            if (ml.empty()) break;
+            b.makeMove(ml[static_cast<int>(next() % static_cast<std::uint64_t>(ml.size()))]);
+        }
+    }
+    std::vector<int> perm(static_cast<std::size_t>(half));
+    for (int j = 0; j < half; ++j) perm[j] = j;
+    std::stable_sort(perm.begin(), perm.end(), [&](int x, int y) { return zeros[x] > zeros[y]; });
+
+    // FT weights (every feature row) and bias.
+    std::vector<std::int8_t> row8(static_cast<std::size_t>(hl));
+    for (std::size_t r = 0; r < TI; ++r) {
+        std::int8_t* row = n.l0w_i8.data() + r * hl;
+        for (int j = 0; j < half; ++j) { row8[j] = row[perm[j]]; row8[half + j] = row[half + perm[j]]; }
+        std::memcpy(row, row8.data(), static_cast<std::size_t>(hl));
+    }
+    std::vector<std::int16_t> b16(n.l0b_i);
+    for (int j = 0; j < half; ++j) { n.l0b_i[j] = b16[perm[j]]; n.l0b_i[half + j] = b16[half + perm[j]]; }
+    // L1 inputs: [0, half) the side to move's neurons, [half, hl) the other side's.
+    for (std::size_t r = 0; r < static_cast<std::size_t>(OB) * L2; ++r) {
+        std::int8_t* row = n.l1w_dot.data() + r * hl;
+        for (int j = 0; j < half; ++j) { row8[j] = row[perm[j]]; row8[half + j] = row[half + perm[j]]; }
+        std::memcpy(row, row8.data(), static_cast<std::size_t>(hl));
+    }
+    // Sparse layout: [bucket][chunk k][output o][4 inputs 4k..4k+3].
+    const int nch = hl / 4;
+    n.l1w_sp.resize(static_cast<std::size_t>(OB) * nch * L2 * 4);
+    for (int bkt = 0; bkt < OB; ++bkt)
+        for (int k = 0; k < nch; ++k)
+            for (int o = 0; o < L2; ++o)
+                for (int t = 0; t < 4; ++t)
+                    n.l1w_sp[((static_cast<std::size_t>(bkt) * nch + k) * L2 + o) * 4 + t] =
+                        n.l1w_dot[(static_cast<std::size_t>(bkt) * L2 + o) * hl + 4 * k + t];
+}
+
 // ---- incremental base accumulator (thread-local) ----------------------------
 // Persistent per-perspective BASE accumulator (int16), maintained across
 // make/unmake so the base sum isn't rebuilt every eval. Only the base block is
@@ -735,8 +1137,6 @@ static_assert(ACC_STACK > MAX_PLY + 1, "accumulator stack must cover every searc
 struct Acc {
     alignas(64) std::int16_t v[2][MAX_HL];  // v[0]=WHITE perspective, v[1]=BLACK perspective
 };
-thread_local std::vector<Acc> g_stack;
-thread_local int g_ply = -1;  // -1 = uninitialised -> evaluate() recomputes the base
 
 // Fixed-point (int32) accumulator stack for the float labeler path. Shares g_ply and
 // the g_bb bitboard stack with the quant path; only one of g_stack / g_stack_fx is
@@ -744,7 +1144,6 @@ thread_local int g_ply = -1;  // -1 = uninitialised -> evaluate() recomputes the
 struct AccFx {
     alignas(64) std::int32_t v[2][MAX_HL];
 };
-thread_local std::vector<AccFx> g_stack_fx;
 
 // Absolute-perspective base feature index (persp 0=WHITE, 1=BLACK). color 0/1,
 // t0 0..5 (pawn..king), king_abs = absolute king square of persp's side.
@@ -816,7 +1215,7 @@ inline void fused_apply_src_fx(std::int32_t* dst, const std::int32_t* src, const
 void refresh_into_fx(AccFx& a, const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl;
-    const std::int32_t* l0 = n.l0w_fx.data();
+    const std::int32_t* l0 = n.l0w_fx_p;
     const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
     static thread_local const std::int32_t* cols[2][1024];
     int nc[2] = {0, 0};
@@ -855,10 +1254,9 @@ struct BB {
     }
 };
 
-// Per-ply incremental board bitboards, maintained in lockstep with g_stack so a
-// normal move reads its before-state from g_bb[g_ply] instead of rebuilding a BB
-// from board.at() every make. Same g_ply / reset / make / unmake / null hooks.
-thread_local std::vector<BB> g_bb;
+// Per-ply incremental board bitboards, maintained in lockstep with the accumulator stack so a
+// normal move reads its before-state from bb[ply] instead of rebuilding a BB from board.at()
+// every make. Same ply / reset / make / unmake / null hooks.
 
 // Item #9 (novelty ledger): how many NEW attacks on a HIGHER-valued enemy piece the last acc_make's
 // move created, counted for the mover's side only. The threat-delta emitter already has the attacker
@@ -867,7 +1265,6 @@ thread_local std::vector<BB> g_bb;
 // semantically sharp count (this move makes a threat) instead of a magnitude of feature change.
 // Zero on the king-cross refresh path, where the threat set is rebuilt rather than emitted as a
 // delta: a false negative on a few percent of moves, never a false positive.
-thread_local int g_threats_made = 0;
 
 // Squares of all pieces attacking `s` (both colors).
 inline std::uint64_t attackers_of(const BB& bb, int s) {
@@ -893,6 +1290,90 @@ struct FeatList {
     inline void push(int p, std::uint32_t idx) { v[p][n[p]++] = idx; }
     inline void clear() { n[0] = n[1] = 0; }
 };
+
+}  // namespace
+
+// Per-search-thread incremental state (accumulator stacks, bitboard stack, delta scratch). The
+// search owns one per worker and passes it to every call, so the hot path makes no thread-local
+// lookups (NPS 3.6 item C1: on macOS every thread_local access is a call through the TLV thunk).
+struct Context {
+    std::vector<Acc>   stack;     // int16 accumulators (quant net), one per ply
+    std::vector<AccFx> stack_fx;  // int32 fixed-point accumulators (float labeler net)
+    std::vector<BB>    bb;        // per-ply board bitboards, in lockstep with the stack
+    int ply = -1;                 // -1 = uninitialised -> evaluate() recomputes from the board
+    int threats_made = 0;         // item #9: see acc_threats_made()
+    const void* addp[2][1024];    // delta column scratch (acc_make)
+    const void* subp[2][1024];
+    const void* ra[40];           // king-rebucket scratch
+    const void* rs[40];
+    // K1: per [perspective][mirror][bucket], the base-column sum of the pieces in `by` (as of the
+    // last time this bucket was used).
+    struct Finny {
+        alignas(64) std::int16_t acc[MAX_HL];
+        std::uint64_t by[16];
+        bool valid = false;
+    };
+    Finny finny[2][2][kKingBuckets];
+    unsigned finny_gen = 0;      // g_net_gen the caches were built for
+    // evaluate()'s full-recompute fallback (no incremental accumulator yet). Kept here, not in
+    // evaluate()'s frame: a frame over one page makes every call run the Windows stack probe.
+    alignas(64) std::int16_t fb[2][MAX_HL];
+    // FXZ: stack_fx[p] holds its values only when fx_ok[p]; otherwise fx_pend[p] has the column lists
+    // acc_make recorded for it (adds in col[s][0, na), subs in col[s][na, na + ns)).
+    struct FxPend { int na[2], ns[2]; const std::int32_t* col[2][kFxPendCap]; };
+    std::vector<std::uint8_t> fx_ok;
+    std::vector<FxPend> fx_pend;
+#if SC_FXP
+    AccFx fx_fb;   // FXP: the float eval's from-scratch fallback (kept out of its frame)
+#endif
+#ifdef SC_LZSTAT
+    std::uint8_t lz_needed[ACC_STACK] = {};   // measurement only: was this ply's accumulator read?
+#endif
+};
+// FXZ: bring stack_fx[p] up to date from the newest computed ancestor (fx_ok[0] is always set),
+// one ply at a time, each the src->dst fused pass acc_make would have made.
+inline void fx_ensure(Context& cx, int p) {
+    if (cx.fx_ok[p]) return;
+    int q = p - 1;
+    while (!cx.fx_ok[q]) --q;
+    const int hl = g_net.hl;
+    for (int k = q + 1; k <= p; ++k) {
+        const Context::FxPend& e = cx.fx_pend[k];
+        for (int sd = 0; sd < 2; ++sd)
+            fused_apply_src_fx(cx.stack_fx[k].v[sd], cx.stack_fx[k - 1].v[sd], e.col[sd], e.na[sd],
+                               e.col[sd] + e.na[sd], e.ns[sd], hl);
+        cx.fx_ok[k] = 1;
+    }
+}
+#ifdef SC_LZSTAT
+// Measurement build: how many accumulator updates are popped without that ply or any descendant
+// ever being evaluated (what lazy updates could skip). Printed to stderr at exit.
+std::atomic<long> g_lz_upd{0}, g_lz_skip{0}, g_lz_null{0}, g_lz_null_skip{0};
+// Move kinds acc_make saw: castle, promotion, en passant, king move across the mirror (full refresh),
+// king move across a bucket only (rebucket), other king move.
+std::atomic<long> g_lz_kind[6] = {};
+struct LzPrinter {
+    ~LzPrinter() {
+        std::fprintf(stderr, "LZSTAT updates %ld skipped %ld (%.2f%%) | null %ld skipped %ld\n", g_lz_upd.load(),
+                     g_lz_skip.load(), 100.0 * g_lz_skip.load() / std::max(1L, g_lz_upd.load()), g_lz_null.load(),
+                     g_lz_null_skip.load());
+        std::fprintf(stderr, "LZSTAT kinds castle %ld promo %ld ep %ld kmirror %ld krebucket %ld kother %ld\n",
+                     g_lz_kind[0].load(), g_lz_kind[1].load(), g_lz_kind[2].load(), g_lz_kind[3].load(),
+                     g_lz_kind[4].load(), g_lz_kind[5].load());
+    }
+} g_lz_printer;
+#endif
+
+Context* context_new() { return new Context(); }
+void context_free(Context* c) { delete c; }
+
+namespace {
+// The context of callers that do not own one (UCI debug commands): one per thread.
+Context& tl_context() {
+    thread_local Context c;
+    return c;
+}
+
 
 // Collect all threat feature indices of the piece `sf` on `sq` (board `bb`) into
 // `out`, for both perspectives.
@@ -1119,6 +1600,36 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
         V4 = OP(V4, vmovl_s8(vget_low_s8(p2)));  V5 = OP(V5, vmovl_s8(vget_high_s8(p2)));             \
         V6 = OP(V6, vmovl_s8(vget_low_s8(p3)));  V7 = OP(V7, vmovl_s8(vget_high_s8(p3)));             \
     }
+    // A2 (NPS 3.6): 128 int16 per chunk, one set of 16 accumulators -- half the chunk iterations
+    // and column-pointer reloads of the 64-lane form. Same wrapping int16 sums -> bit-identical.
+    if constexpr (SC_NPS_A2) {
+        for (; c + 128 <= hl; c += 128) {
+            int16x8_t v0 = vld1q_s16(src + c),       v1 = vld1q_s16(src + c + 8),
+                      v2 = vld1q_s16(src + c + 16),  v3 = vld1q_s16(src + c + 24),
+                      v4 = vld1q_s16(src + c + 32),  v5 = vld1q_s16(src + c + 40),
+                      v6 = vld1q_s16(src + c + 48),  v7 = vld1q_s16(src + c + 56),
+                      v8 = vld1q_s16(src + c + 64),  v9 = vld1q_s16(src + c + 72),
+                      v10 = vld1q_s16(src + c + 80), v11 = vld1q_s16(src + c + 88),
+                      v12 = vld1q_s16(src + c + 96), v13 = vld1q_s16(src + c + 104),
+                      v14 = vld1q_s16(src + c + 112), v15 = vld1q_s16(src + c + 120);
+            for (int k = 0; k < na; ++k) {
+                const std::int8_t* P = add[k];   // SCN_COL64 adds the chunk offset c
+                SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vaddq_s16)
+                SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vaddq_s16)
+            }
+            for (int k = 0; k < ns; ++k) {
+                const std::int8_t* P = sub[k];   // SCN_COL64 adds the chunk offset c
+                SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vsubq_s16)
+                SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vsubq_s16)
+            }
+            vst1q_s16(dst + c,       v0);  vst1q_s16(dst + c + 8,   v1);  vst1q_s16(dst + c + 16,  v2);
+            vst1q_s16(dst + c + 24,  v3);  vst1q_s16(dst + c + 32,  v4);  vst1q_s16(dst + c + 40,  v5);
+            vst1q_s16(dst + c + 48,  v6);  vst1q_s16(dst + c + 56,  v7);  vst1q_s16(dst + c + 64,  v8);
+            vst1q_s16(dst + c + 72,  v9);  vst1q_s16(dst + c + 80,  v10); vst1q_s16(dst + c + 88,  v11);
+            vst1q_s16(dst + c + 96,  v12); vst1q_s16(dst + c + 104, v13); vst1q_s16(dst + c + 112, v14);
+            vst1q_s16(dst + c + 120, v15);
+        }
+    }
     for (; c + 64 <= hl; c += 64) {
         int16x8_t v0 = vld1q_s16(src + c),      v1 = vld1q_s16(src + c + 8),
                   v2 = vld1q_s16(src + c + 16), v3 = vld1q_s16(src + c + 24),
@@ -1207,7 +1718,8 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
     auto w16 = [](const std::int8_t* p) {
         return _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
     };
-    if (na + ns <= 2) {   // A2d: 1-add/1-sub makes go column-outer (long predictable loops)
+    // A2d: makes with at most SC_NPS_SMALLCOLS columns go column-outer (long predictable loops).
+    if (na + ns <= SC_NPS_SMALLCOLS) {
         const std::int16_t* s = src;
         for (int k = 0; k < na; ++k, s = dst) {
             const std::int8_t* w = add[k];
@@ -1231,6 +1743,31 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
         return;
     }
     int c = 0;
+    // A2 (NPS 3.6) on AVX2: 128 int16 per chunk, one set of 8 ymm accumulators -- half the chunk
+    // iterations and column-pointer reloads of the 64-lane form. int16 adds wrap -> bit-identical.
+    if constexpr (SC_NPS_A2) {
+        for (; c + 128 <= hl; c += 128) {
+            auto ldv = [&](int o) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + o)); };
+            __m256i v0 = ldv(0), v1 = ldv(16), v2 = ldv(32), v3 = ldv(48),
+                    v4 = ldv(64), v5 = ldv(80), v6 = ldv(96), v7 = ldv(112);
+            for (int k = 0; k < na; ++k) {
+                const std::int8_t* p = add[k] + c;
+                v0 = _mm256_add_epi16(v0, w16(p));      v1 = _mm256_add_epi16(v1, w16(p + 16));
+                v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+                v4 = _mm256_add_epi16(v4, w16(p + 64)); v5 = _mm256_add_epi16(v5, w16(p + 80));
+                v6 = _mm256_add_epi16(v6, w16(p + 96)); v7 = _mm256_add_epi16(v7, w16(p + 112));
+            }
+            for (int k = 0; k < ns; ++k) {
+                const std::int8_t* p = sub[k] + c;
+                v0 = _mm256_sub_epi16(v0, w16(p));      v1 = _mm256_sub_epi16(v1, w16(p + 16));
+                v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+                v4 = _mm256_sub_epi16(v4, w16(p + 64)); v5 = _mm256_sub_epi16(v5, w16(p + 80));
+                v6 = _mm256_sub_epi16(v6, w16(p + 96)); v7 = _mm256_sub_epi16(v7, w16(p + 112));
+            }
+            auto stv = [&](int o, __m256i v) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + o), v); };
+            stv(0, v0); stv(16, v1); stv(32, v2); stv(48, v3); stv(64, v4); stv(80, v5); stv(96, v6); stv(112, v7);
+        }
+    }
     for (; c + 64 <= hl; c += 64) {   // 64 int16 per chunk (4 vectors x 2 lanes), src -> dst (A9)
         __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c));
         __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + 16));
@@ -1360,6 +1897,40 @@ inline void fused_apply_src_fx(std::int32_t* dst, const std::int32_t* src, const
         vst1q_s32(dst + c + 4, vaddq_s32(a1, b1));
     }
 #else
+#if defined(__AVX2__)
+    if constexpr (SC_FX_AVX2) {   // one src -> dst pass, 64 int32 (8 ymm) per chunk; int32 sums -> bit-exact
+        auto ld = [](const std::int32_t* q) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q)); };
+        auto st = [](std::int32_t* q, __m256i v) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(q), v); };
+        int c = 0;
+        for (; c + 64 <= hl; c += 64) {
+            __m256i v0 = ld(src + c),      v1 = ld(src + c + 8),  v2 = ld(src + c + 16), v3 = ld(src + c + 24),
+                    v4 = ld(src + c + 32), v5 = ld(src + c + 40), v6 = ld(src + c + 48), v7 = ld(src + c + 56);
+            for (int k = 0; k < na; ++k) {
+                const std::int32_t* q = add[k] + c;
+                v0 = _mm256_add_epi32(v0, ld(q));      v1 = _mm256_add_epi32(v1, ld(q + 8));
+                v2 = _mm256_add_epi32(v2, ld(q + 16)); v3 = _mm256_add_epi32(v3, ld(q + 24));
+                v4 = _mm256_add_epi32(v4, ld(q + 32)); v5 = _mm256_add_epi32(v5, ld(q + 40));
+                v6 = _mm256_add_epi32(v6, ld(q + 48)); v7 = _mm256_add_epi32(v7, ld(q + 56));
+            }
+            for (int k = 0; k < ns; ++k) {
+                const std::int32_t* q = sub[k] + c;
+                v0 = _mm256_sub_epi32(v0, ld(q));      v1 = _mm256_sub_epi32(v1, ld(q + 8));
+                v2 = _mm256_sub_epi32(v2, ld(q + 16)); v3 = _mm256_sub_epi32(v3, ld(q + 24));
+                v4 = _mm256_sub_epi32(v4, ld(q + 32)); v5 = _mm256_sub_epi32(v5, ld(q + 40));
+                v6 = _mm256_sub_epi32(v6, ld(q + 48)); v7 = _mm256_sub_epi32(v7, ld(q + 56));
+            }
+            st(dst + c, v0);      st(dst + c + 8, v1);  st(dst + c + 16, v2); st(dst + c + 24, v3);
+            st(dst + c + 32, v4); st(dst + c + 40, v5); st(dst + c + 48, v6); st(dst + c + 56, v7);
+        }
+        for (; c < hl; c += 8) {   // hl % 64 tail (empty for hl = 512)
+            __m256i v = ld(src + c);
+            for (int k = 0; k < na; ++k) v = _mm256_add_epi32(v, ld(add[k] + c));
+            for (int k = 0; k < ns; ++k) v = _mm256_sub_epi32(v, ld(sub[k] + c));
+            st(dst + c, v);
+        }
+        return;
+    }
+#endif
     if (dst != src) std::memcpy(dst, src, static_cast<std::size_t>(hl) * sizeof(std::int32_t));
     for (int k = 0; k < na; ++k) { const std::int32_t* w = add[k]; for (int j = 0; j < hl; ++j) dst[j] += w[j]; }
     for (int k = 0; k < ns; ++k) { const std::int32_t* w = sub[k]; for (int j = 0; j < hl; ++j) dst[j] -= w[j]; }
@@ -1396,10 +1967,6 @@ inline void apply_diff(std::int16_t* acc, std::uint32_t* bef, int nb, std::uint3
     fused_apply(acc, addp, nadd, subp, nsub, hl);
 }
 
-inline int output_bucket(const Board& board, int OB) {
-    const int divisor = (32 + OB - 1) / OB;
-    return std::clamp((int(board.occ().count()) - 2) / divisor, 0, OB - 1);
-}
 
 // L2/L3 tail. Two numerically-close paths: a float matvec (bit-identical to the
 // trainer/stock body) and an int8 sdot path (weights quantized at load; screlu
@@ -1433,6 +2000,7 @@ Value finish_body(const Net& n, const float* x1, int b) {
     }
 #endif
     std::array<float, 32> x2{};
+    [[maybe_unused]] unsigned nz3 = 0xFFFFFFFFu;   // AVX2: the nonzero x2 (L3S)
     const float* l2w = n.l2w.data();
     const float* l2b = n.l2b.data() + b * 32;
     const std::size_t ostride = static_cast<std::size_t>(OB) * 32;
@@ -1462,7 +2030,12 @@ Value finish_body(const Net& n, const float* x1, int b) {
         alignas(16) float tmp[32];
         vst1q_f32(tmp,c0);    vst1q_f32(tmp+4,c1);  vst1q_f32(tmp+8,c2);  vst1q_f32(tmp+12,c3);
         vst1q_f32(tmp+16,c4); vst1q_f32(tmp+20,c5); vst1q_f32(tmp+24,c6); vst1q_f32(tmp+28,c7);
-        for (int o = 0; o < 32; ++o) x2[o] = screlu(tmp[o]);
+        if constexpr (SC_NPS_L3S) {
+            nz3 = 0;
+            for (int o = 0; o < 32; ++o) { x2[o] = screlu(tmp[o]); nz3 |= static_cast<unsigned>(x2[o] != 0.0f) << o; }
+        } else {
+            for (int o = 0; o < 32; ++o) x2[o] = screlu(tmp[o]);
+        }
     } else
     // 32x32 L2 matvec, 4 outputs at a time; per-output i-accumulation fmla chain,
     // matching the fp-contracted scalar -> bit-identical.
@@ -1485,20 +2058,36 @@ Value finish_body(const Net& n, const float* x1, int b) {
         (void)l2w;
         __m256 c0 = _mm256_loadu_ps(l2b), c1 = _mm256_loadu_ps(l2b + 8),
                c2 = _mm256_loadu_ps(l2b + 16), c3 = _mm256_loadu_ps(l2b + 24);
-        for (int i = 0; i < L2; ++i) {
+        auto row = [&](int i) {
             const __m256 xi = _mm256_set1_ps(x1[i]);
             const float* w = w2base + static_cast<std::size_t>(i) * wstride;
             c0 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w),      c0);
             c1 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 8),  c1);
             c2 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 16), c2);
             c3 = _mm256_fmadd_ps(xi, _mm256_loadu_ps(w + 24), c3);
+        };
+        if (!g_l1dense && L2 == 32) {
+            // NNZ-sparse L2 (the NEON §L3 form): only the nonzero x1 (screlu >= 0, about half are
+            // zero), in ascending i, so every output's fma chain is the dense one minus terms that
+            // add +0 -- the same value (a +-0 sum can only flip a zero's sign, which the screlu below
+            // erases). Shorter chains: the dense loop is bound by fma latency, 32 deep.
+            const __m256 z = _mm256_setzero_ps();
+            unsigned m = 0;
+            for (int q = 0; q < 4; ++q)
+                m |= static_cast<unsigned>(_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(x1 + 8 * q), z, _CMP_NEQ_OQ))) << (8 * q);
+            while (m) { row(__builtin_ctz(m)); m &= m - 1; }
+        } else {
+            for (int i = 0; i < L2; ++i) row(i);
         }
         alignas(32) float tmp[32];
         _mm256_store_ps(tmp, c0); _mm256_store_ps(tmp + 8, c1);
         _mm256_store_ps(tmp + 16, c2); _mm256_store_ps(tmp + 24, c3);
+        nz3 = 0;
         for (int o = 0; o < 32; o += 8) {   // 8-wide screlu, same ops per lane (clamp, square); A7
             __m256 v = _mm256_min_ps(_mm256_max_ps(_mm256_load_ps(tmp + o), _mm256_setzero_ps()), _mm256_set1_ps(1.0f));
-            _mm256_storeu_ps(x2.data() + o, _mm256_mul_ps(v, v));
+            const __m256 sq = _mm256_mul_ps(v, v);
+            _mm256_storeu_ps(x2.data() + o, sq);
+            nz3 |= static_cast<unsigned>(_mm256_movemask_ps(_mm256_cmp_ps(sq, _mm256_setzero_ps(), _CMP_NEQ_OQ))) << o;
         }
     }
 #else
@@ -1512,6 +2101,13 @@ Value finish_body(const Net& n, const float* x1, int b) {
     y = n.l3b[b];
     {   // contiguous per-bucket L3 row (A6); the sequential fma chain is unchanged -> bit-identical
         const float* w3 = n.l3w_t.data() + static_cast<std::size_t>(b) * 32;
+#if defined(__AVX2__) || (defined(__ARM_NEON) && SC_NPS_L3S)
+        // L3S: the same chain over the nonzero x2 only, ascending (dropped terms add +0: at most a
+        // zero's sign changes, and lround maps +-0 alike). The dense chain is 32 dependent fma.
+        if (!g_l1dense) {
+            while (nz3) { const int i = __builtin_ctz(nz3); nz3 &= nz3 - 1; y += x2[i] * w3[i]; }
+        } else
+#endif
         for (int i = 0; i < 32; ++i) y += x2[i] * w3[i];
     }
     const float cp = std::clamp(400.0f * y, -15000.0f, 15000.0f);
@@ -1527,6 +2123,23 @@ static const std::uint8_t kNnzLut[16][4] = {
     {0,0,0,0},{0,0,0,0},{1,0,0,0},{0,1,0,0},{2,0,0,0},{0,2,0,0},{1,2,0,0},{0,1,2,0},
     {3,0,0,0},{0,3,0,0},{1,3,0,0},{0,1,3,0},{2,3,0,0},{0,2,3,0},{1,2,3,0},{0,1,2,3}};
 static const std::uint8_t kNnzPop[16] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4};
+// S1: kNnzLut as uint16 offsets, for the sparse L1's chunk-index list.
+alignas(8) static const std::uint16_t kNnzLut16[16][4] = {
+    {0,0,0,0},{0,0,0,0},{1,0,0,0},{0,1,0,0},{2,0,0,0},{0,2,0,0},{1,2,0,0},{0,1,2,0},
+    {3,0,0,0},{0,3,0,0},{1,3,0,0},{0,1,3,0},{2,3,0,0},{0,2,3,0},{1,2,3,0},{0,1,2,3}};
+#if defined(__AVX2__)
+// S1 on AVX2: for an 8-bit nonzero-chunk mask, the ascending set-bit offsets (one 128-bit store
+// per 8 chunks, no data-dependent branch).
+alignas(16) static constexpr auto kNnzLut8 = [] {
+    std::array<std::array<std::uint16_t, 8>, 256> t{};
+    for (int m = 0; m < 256; ++m) {
+        int c = 0;
+        for (int i = 0; i < 8; ++i)
+            if ((m >> i) & 1) t[m][c++] = static_cast<std::uint16_t>(i);
+    }
+    return t;
+}();
+#endif
 
 inline int build_nnz(const float* h, int n, int* nz) {
 #if defined(__ARM_NEON)
@@ -1552,8 +2165,105 @@ inline int build_nnz(const float* h, int n, int* nz) {
 // SWAP=false: the position as it is. SWAP=true: the same accumulator read with the two
 // perspectives exchanged (the position after a pass), negated so the result is from the
 // ORIGINAL side to move's point of view. See evaluate_pass() in nnue.hpp.
+#if SC_FXP
 template <bool SWAP>
-Value eval_float_t(const Board& board) {
+[[gnu::noinline]] Value eval_float_t0(Context& cx, const Board& board);
+
+[[gnu::noinline, gnu::cold]] void fx_verify_now(const AccFx& a, int stmp, const Board& board, int ply) {
+    AccFx chk;
+    refresh_into_fx(chk, board);
+    for (int j = 0; j < g_net.hl; ++j)
+        if (a.v[stmp][j] != chk.v[stmp][j] || a.v[1 - stmp][j] != chk.v[1 - stmp][j]) {
+            std::fprintf(stderr, "[nnue] FX ACC MISMATCH ply=%d j=%d inc=%d,%d chk=%d,%d\n",
+                         ply, j, a.v[stmp][j], a.v[1 - stmp][j], chk.v[stmp][j], chk.v[1 - stmp][j]);
+            break;
+        }
+}
+
+template <bool SWAP>
+[[gnu::noinline]] Value eval_float_t(Context& cx, const Board& board) {   // its buffers stay out of evaluate()'s frame
+    const Net& n = g_net;
+    const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
+    if (g_l1dense || L2 != 32 || (hl & 63) != 0) return eval_float_t0<SWAP>(cx, board);
+    const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
+    const AccFx* ap;
+    if (cx.ply >= 0) {  // search has the incremental accumulator in sync
+        if constexpr (SC_FX_LAZY) fx_ensure(cx, cx.ply);
+        ap = &cx.stack_fx[cx.ply];
+#ifdef SC_LZSTAT
+        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
+#endif
+        if (g_verify) fx_verify_now(*ap, stmp, board, cx.ply);   // incremental must equal a fresh refresh
+    } else {  // outside search (bare `eval`): from-scratch fixed-point
+        refresh_into_fx(cx.fx_fb, board);
+        ap = &cx.fx_fb;
+    }
+    // h = crelu(a) * crelu(b) of (float)v * 2^-22 (the FXA fill and pairwise ops, lane for lane), and
+    // per 64 inputs the mask of nonzero h for the L1. SWAP exchanges the two perspectives' halves.
+    const int off_stm = SWAP ? half : 0;
+    const int off_ntm = SWAP ? 0 : half;
+    alignas(64) float h[MAX_HL];
+    std::uint64_t hm[MAX_HL / 64] = {};
+    {
+        const __m256 inv = _mm256_set1_ps(float(1.0 / FX_S)), vz = _mm256_setzero_ps(), vo = _mm256_set1_ps(1.0f);
+        auto cl = [&](const std::int32_t* q) {
+            return _mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(
+                       _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q))), inv), vz), vo);
+        };
+        const std::int32_t* vs = ap->v[stmp];
+        const std::int32_t* vn = ap->v[1 - stmp];
+        for (int i = 0; i < half; i += 8) {
+            const __m256 ps = _mm256_mul_ps(cl(vs + i), cl(vs + i + half));
+            const __m256 pn = _mm256_mul_ps(cl(vn + i), cl(vn + i + half));
+            _mm256_store_ps(h + off_stm + i, ps);
+            _mm256_store_ps(h + off_ntm + i, pn);
+            hm[(off_stm + i) >> 6] |= static_cast<std::uint64_t>(static_cast<unsigned>(
+                _mm256_movemask_ps(_mm256_cmp_ps(ps, vz, _CMP_NEQ_OQ)))) << ((off_stm + i) & 63);
+            hm[(off_ntm + i) >> 6] |= static_cast<std::uint64_t>(static_cast<unsigned>(
+                _mm256_movemask_ps(_mm256_cmp_ps(pn, vz, _CMP_NEQ_OQ)))) << ((off_ntm + i) & 63);
+        }
+    }
+    const int b = n.obucket[board.occ().count()];
+    float x1[MAX_L2];
+    {   // the FXA/FXB L1: input-major over the nonzero h[i] ascending, all 32 outputs in 4 ymm
+        const bool bm = !n.l1w_bm.empty();
+        const std::size_t istride = bm ? 32 : static_cast<std::size_t>(OB) * L2;
+        const float* wbase = bm ? n.l1w_bm.data() + static_cast<std::size_t>(b) * hl * 32
+                                : &n.l1w[static_cast<std::size_t>(b) * L2];
+        const float* l1bb  = &n.l1b[b * L2];
+        __m256 a0 = _mm256_loadu_ps(l1bb), a1 = _mm256_loadu_ps(l1bb + 8),
+               a2 = _mm256_loadu_ps(l1bb + 16), a3 = _mm256_loadu_ps(l1bb + 24);
+        for (int g = 0; g < hl; g += 64) {
+            std::uint64_t m = hm[g >> 6];
+            while (m) {
+                const int i = g + __builtin_ctzll(m);
+                m &= m - 1;
+                const __m256 hv = _mm256_set1_ps(h[i]);
+                const float* w = wbase + static_cast<std::size_t>(i) * istride;
+                a0 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w),      a0);
+                a1 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 8),  a1);
+                a2 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 16), a2);
+                a3 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 24), a3);
+            }
+        }
+        const __m256 vz = _mm256_setzero_ps(), vo = _mm256_set1_ps(1.0f);
+        const __m256 acc[4] = {a0, a1, a2, a3};
+        for (int q = 0; q < 4; ++q) {   // 8-wide screlu, same ops per lane (clamp, square)
+            const __m256 v = _mm256_min_ps(_mm256_max_ps(acc[q], vz), vo);
+            _mm256_storeu_ps(x1 + 8 * q, _mm256_mul_ps(v, v));
+        }
+    }
+    const Value v = finish_body(n, x1, b);
+    return SWAP ? -v : v;
+}
+// The float eval before FXP: on x86 its fallback (dense-L1 probe, L2 != 32, HL % 64 != 0).
+#define SC_FX_EVAL0 eval_float_t0
+#else
+#define SC_FX_EVAL0 eval_float_t
+#endif
+
+template <bool SWAP>
+[[gnu::noinline]] Value SC_FX_EVAL0(Context& cx, const Board& board) {
     const Net& n = g_net;
     const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
     // §3.1: read the incremental fixed-point accumulator (int32, scale FX_S) and
@@ -1574,20 +2284,36 @@ Value eval_float_t(const Board& board) {
             vst1q_f32(acc_ntm + j, vmulq_f32(vcvtq_f32_s32(vld1q_s32(&a.v[1 - stmp][j])), inv));
         }
 #else
+#if defined(__AVX2__)
+        if constexpr (SC_FX_AVX2) {   // the NEON §L4 form: (float)v * 2^-22, equal to the scalar one after CReLU
+            const __m256 inv = _mm256_set1_ps(float(1.0 / FX_S));
+            for (int j = 0; j < hl; j += 8) {
+                _mm256_store_ps(acc_stm + j, _mm256_mul_ps(_mm256_cvtepi32_ps(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&a.v[stmp][j]))), inv));
+                _mm256_store_ps(acc_ntm + j, _mm256_mul_ps(_mm256_cvtepi32_ps(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&a.v[1 - stmp][j]))), inv));
+            }
+            return;
+        }
+#endif
         for (int j = 0; j < hl; ++j) {
             acc_stm[j] = float(double(a.v[stmp][j])     / FX_S);
             acc_ntm[j] = float(double(a.v[1 - stmp][j]) / FX_S);
         }
 #endif
     };
-    if (g_ply >= 0) {  // search has the incremental accumulator in sync
-        const AccFx& a = g_stack_fx[g_ply];
+    if (cx.ply >= 0) {  // search has the incremental accumulator in sync
+        if constexpr (SC_FX_LAZY) fx_ensure(cx, cx.ply);
+        const AccFx& a = cx.stack_fx[cx.ply];
+#ifdef SC_LZSTAT
+        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
+#endif
         if (g_verify) {  // incremental must equal a fresh refresh, bit-exact
             AccFx chk; refresh_into_fx(chk, board);
             for (int j = 0; j < hl; ++j)
                 if (a.v[stmp][j] != chk.v[stmp][j] || a.v[1 - stmp][j] != chk.v[1 - stmp][j]) {
                     std::fprintf(stderr, "[nnue] FX ACC MISMATCH ply=%d j=%d inc=%d,%d chk=%d,%d\n",
-                                 g_ply, j, a.v[stmp][j], a.v[1 - stmp][j], chk.v[stmp][j], chk.v[1 - stmp][j]);
+                                 cx.ply, j, a.v[stmp][j], a.v[1 - stmp][j], chk.v[stmp][j], chk.v[1 - stmp][j]);
                     break;
                 }
         }
@@ -1614,16 +2340,30 @@ Value eval_float_t(const Board& board) {
         vst1q_f32(h + off_ntm + i, vmulq_f32(c, d));
     }
 #else
-    for (int i = 0; i < half; ++i) {
+    int pw0 = 0;
+#if defined(__AVX2__)
+    if constexpr (SC_FX_AVX2) {   // the NEON §2.3 form, 8 lanes (no input is -0.0: an int 0 converts to +0)
+        const __m256 vz = _mm256_setzero_ps(), vo = _mm256_set1_ps(1.0f);
+        auto cl = [&](const float* q) { return _mm256_min_ps(_mm256_max_ps(_mm256_load_ps(q), vz), vo); };
+        for (; pw0 + 8 <= half; pw0 += 8) {
+            _mm256_storeu_ps(h + off_stm + pw0, _mm256_mul_ps(cl(acc_stm + pw0), cl(acc_stm + pw0 + half)));
+            _mm256_storeu_ps(h + off_ntm + pw0, _mm256_mul_ps(cl(acc_ntm + pw0), cl(acc_ntm + pw0 + half)));
+        }
+    }
+#endif
+    for (int i = pw0; i < half; ++i) {
         h[off_stm + i] = crelu(acc_stm[i]) * crelu(acc_stm[i + half]);
         h[off_ntm + i] = crelu(acc_ntm[i]) * crelu(acc_ntm[i + half]);
     }
 #endif
-    const int b = output_bucket(board, OB);
+    const int b = n.obucket[board.occ().count()];
     float x1[MAX_L2];
 #if defined(__ARM_NEON)
-    const std::size_t istride = static_cast<std::size_t>(OB) * L2;
-    const float* wbase = &n.l1w[static_cast<std::size_t>(b) * L2];   // row i at + i*istride + o
+    // Row i at wbase + i*istride + o: the bucket-major copy when built (FXB), else the [i][bucket][o] rows.
+    const bool bm = !n.l1w_bm.empty();
+    const std::size_t istride = bm ? 32 : static_cast<std::size_t>(OB) * L2;
+    const float* wbase = bm ? n.l1w_bm.data() + static_cast<std::size_t>(b) * hl * 32
+                            : &n.l1w[static_cast<std::size_t>(b) * L2];
     const float* l1bb  = &n.l1b[b * L2];
     if (!g_l1dense && L2 == 32) {
         // §L1 NNZ sparse (input-major): iterate only nonzero h[i]. A skipped h[i]==0 would
@@ -1660,6 +2400,43 @@ Value eval_float_t(const Board& board) {
         }
     }
 #else
+#if defined(__AVX2__)
+    if (SC_FX_AVX2 && !g_l1dense && L2 == 32 && (hl & 63) == 0) {
+        // The NEON §L1 form: input-major over the nonzero h[i] (ascending: a 64-bit mask per 64 inputs,
+        // walked with tzcnt), all 32 outputs in 4 ymm. Per output that is the scalar loop's fma chain
+        // (s = fma(h[i], w, s), ascending i, from the bias) minus terms that add +0 -- the same value,
+        // a +-0 sum only flipping a zero's sign, which screlu erases.
+        const bool bm = !n.l1w_bm.empty();
+        const std::size_t istride = bm ? 32 : static_cast<std::size_t>(OB) * L2;
+        const float* wbase = bm ? n.l1w_bm.data() + static_cast<std::size_t>(b) * hl * 32
+                                : &n.l1w[static_cast<std::size_t>(b) * L2];
+        const float* l1bb  = &n.l1b[b * L2];
+        __m256 a0 = _mm256_loadu_ps(l1bb), a1 = _mm256_loadu_ps(l1bb + 8),
+               a2 = _mm256_loadu_ps(l1bb + 16), a3 = _mm256_loadu_ps(l1bb + 24);
+        const __m256 vz = _mm256_setzero_ps();
+        for (int g = 0; g < hl; g += 64) {
+            std::uint64_t m = 0;
+            for (int t = 0; t < 8; ++t)
+                m |= static_cast<std::uint64_t>(static_cast<unsigned>(_mm256_movemask_ps(
+                         _mm256_cmp_ps(_mm256_load_ps(h + g + 8 * t), vz, _CMP_NEQ_OQ)))) << (8 * t);
+            while (m) {
+                const int i = g + __builtin_ctzll(m);
+                m &= m - 1;
+                const __m256 hv = _mm256_set1_ps(h[i]);
+                const float* w = wbase + static_cast<std::size_t>(i) * istride;
+                a0 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w),      a0);
+                a1 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 8),  a1);
+                a2 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 16), a2);
+                a3 = _mm256_fmadd_ps(hv, _mm256_loadu_ps(w + 24), a3);
+            }
+        }
+        const __m256 acc[4] = {a0, a1, a2, a3};
+        for (int q = 0; q < 4; ++q) {   // 8-wide screlu, same ops per lane (clamp, square)
+            const __m256 v = _mm256_min_ps(_mm256_max_ps(acc[q], vz), _mm256_set1_ps(1.0f));
+            _mm256_storeu_ps(x1 + 8 * q, _mm256_mul_ps(v, v));
+        }
+    } else
+#endif
     for (int o = 0; o < L2; ++o) {
         float s = n.l1b[b * L2 + o];
         for (int i = 0; i < hl; ++i)
@@ -1683,38 +2460,46 @@ Value eval_float_t(const Board& board) {
 // positions peak ~112 (verified over 200k positions), so it does not overflow.
 // SWAP as in eval_float_t: false = the position as it is, true = the perspectives exchanged
 // (the position after a pass), negated to the original side to move's point of view.
+// SCNNUE_VERIFY: the incremental accumulator against a fresh recompute (its 2 KB Acc stays out
+// of evaluate()'s frame).
+[[gnu::noinline, gnu::cold]] void verify_acc_now(const Acc& a, int stmp, const Board& board, int ply) {
+    const int hl = g_net.hl;
+    Acc chk;
+    refresh_into(chk, board);
+    for (int j = 0; j < hl; ++j)
+        if (a.v[stmp][j] != chk.v[stmp][j] || a.v[1 - stmp][j] != chk.v[1 - stmp][j]) {
+            std::fprintf(stderr, "[nnue] ACC MISMATCH ply=%d j=%d  inc=%d,%d chk=%d,%d\n",
+                         ply, j, a.v[stmp][j], a.v[1 - stmp][j], chk.v[stmp][j], chk.v[1 - stmp][j]);
+            break;
+        }
+}
 template <bool SWAP>
-Value eval_quant_t(const Board& board) {
+Value eval_quant_t(Context& cx, const Board& board) {
     const Net& n = g_net;
-    const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
+    const int hl = n.hl, half = hl / 2, L2 = n.l2;
 
-    // Buffers used ONLY by the gather fallback; the incremental path reads the
-    // accumulator in place through these pointers (no 2KB memcpy — that copy was
-    // profiled at ~11% of eval on the play path; byte-identical, same int16 values).
-    alignas(64) std::int16_t acc_buf_stm[MAX_HL], acc_buf_ntm[MAX_HL];
+    // The incremental path reads the accumulator in place through these pointers (no 2KB
+    // memcpy — that copy was profiled at ~11% of eval on the play path; byte-identical, same
+    // int16 values). The gather fallback fills the Context's buffers.
     const std::int16_t* acc_stm;
     const std::int16_t* acc_ntm;
     const std::int8_t* l0 = n.l0w_i8.data();
 
     // Full accumulator (base + threats + pp) from the incremental state if the
     // search has it in sync — no gather at all. Else full recompute (fallback).
-    const bool have_acc = (g_ply >= 0);
+    const bool have_acc = (cx.ply >= 0);
     if (have_acc) {
         const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
-        const Acc& a = g_stack[g_ply];
+        const Acc& a = cx.stack[cx.ply];
         acc_stm = a.v[stmp];       // read the accumulator in place — no copy
         acc_ntm = a.v[1 - stmp];
-        if (g_verify) {  // cross-check the incremental accumulator vs a fresh recompute
-            Acc chk;
-            refresh_into(chk, board);
-            for (int j = 0; j < hl; ++j)
-                if (a.v[stmp][j] != chk.v[stmp][j] || a.v[1 - stmp][j] != chk.v[1 - stmp][j]) {
-                    std::fprintf(stderr, "[nnue] ACC MISMATCH ply=%d j=%d  inc=%d,%d chk=%d,%d\n",
-                                 g_ply, j, a.v[stmp][j], a.v[1 - stmp][j], chk.v[stmp][j], chk.v[1 - stmp][j]);
-                    break;
-                }
-        }
+#ifdef SC_LZSTAT
+        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
+#endif
+        if (g_verify) verify_acc_now(a, stmp, board, cx.ply);   // vs a fresh recompute
     } else {
+        std::int16_t* acc_buf_stm = cx.fb[0];
+        std::int16_t* acc_buf_ntm = cx.fb[1];
         for (int j = 0; j < hl; ++j) { acc_buf_stm[j] = n.l0b_i[j]; acc_buf_ntm[j] = n.l0b_i[j]; }
         gather(
             board, n.base_dims,
@@ -1750,9 +2535,27 @@ Value eval_quant_t(const Board& board) {
         const int32x4_t hi = vshrq_n_s32(vmulq_s32(vmovl_s16(vget_high_s16(p)), vM), 21);
         vst1_s8(dst, vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi))));
     };
-    for (int i = 0; i < half; i += 8) {
-        pairwise8(acc_stm + i, h8 + off_stm + i);
-        pairwise8(acc_ntm + i, h8 + off_ntm + i);
+    if constexpr (SC_NPS_P2) {
+        (void)vM; (void)pairwise8;
+        const uint16x8_t one = vdupq_n_u16(1);
+        auto pw16 = [&](const std::int16_t* src, std::int8_t* dst) {
+            const uint16x8_t a0 = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(src), vz), vqa));
+            const uint16x8_t a1 = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(src + 8), vz), vqa));
+            const uint16x8_t b0 = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(src + half), vz), vqa));
+            const uint16x8_t b1 = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(src + half + 8), vz), vqa));
+            uint16x8_t x0 = vmlaq_u16(one, a0, b0), x1 = vmlaq_u16(one, a1, b1);   // 1 + a*b
+            x0 = vsraq_n_u16(x0, x0, 7);  x1 = vsraq_n_u16(x1, x1, 7);             // + (1 + a*b) >> 7
+            vst1q_u8(reinterpret_cast<std::uint8_t*>(dst), vshrn_high_n_u16(vshrn_n_u16(x0, 7), x1, 7));
+        };
+        for (int i = 0; i < half; i += 16) {
+            pw16(acc_stm + i, h8 + off_stm + i);
+            pw16(acc_ntm + i, h8 + off_ntm + i);
+        }
+    } else {
+        for (int i = 0; i < half; i += 8) {
+            pairwise8(acc_stm + i, h8 + off_stm + i);
+            pairwise8(acc_ntm + i, h8 + off_ntm + i);
+        }
     }
 #else
     auto cr = [](int x) -> int { return x < 0 ? 0 : (x > QA ? QA : x); };
@@ -1761,11 +2564,62 @@ Value eval_quant_t(const Board& board) {
         h8[off_ntm + i] = static_cast<std::int8_t>((cr(acc_ntm[i]) * cr(acc_ntm[i + half])) / QA);
     }
 #endif
-    const int b = output_bucket(board, OB);
+    const int b = n.obucket[board.occ().count()];
     const float DEQ = float(QA) * QB;  // h8 already carries the 1/QA scale
     const std::int8_t* wbucket = n.l1w_dot.data() + static_cast<std::size_t>(b) * L2 * hl;
     float x1[MAX_L2];
 #if defined(__ARM_FEATURE_DOTPROD)
+    if (SC_NPS_S1 && L2 == 32 && !n.l1w_sp.empty()) {
+        // S1 sparse L1: list the nonzero 4-byte chunks of h8 (ascending), then for each one add its
+        // 4 inputs x all 32 outputs (eight vdotq over one 128-byte weight block). Two accumulator
+        // sets alternate chunks to halve the dependency chains. Zero chunks add exactly 0, and
+        // integer sums are order-independent -> the same int32 per output as the dense form.
+        alignas(16) std::uint16_t nz[MAX_HL / 4 + 8];
+        int nnz = 0;
+        const std::uint32_t* h32 = reinterpret_cast<const std::uint32_t*>(h8);
+        const uint32x4_t bit = {1u, 2u, 4u, 8u};
+        for (int k = 0; k < hl / 4; k += 4) {
+            const uint32x4_t v = vld1q_u32(h32 + k);
+            const unsigned m = vaddvq_u32(vandq_u32(vtstq_u32(v, v), bit));
+            vst1_u16(nz + nnz, vadd_u16(vdup_n_u16(static_cast<std::uint16_t>(k)), vld1_u16(kNnzLut16[m])));
+            nnz += kNnzPop[m];
+        }
+        const std::int8_t* W = n.l1w_sp.data() + static_cast<std::size_t>(b) * (hl / 4) * 128;
+        int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        int32x4_t c0 = a0, c1 = a0, c2 = a0, c3 = a0, c4 = a0, c5 = a0, c6 = a0, c7 = a0;
+        int j = 0;
+        for (; j + 2 <= nnz; j += 2) {
+            const int k0 = nz[j], k1 = nz[j + 1];
+            const int8x16_t i0 = vreinterpretq_s8_u32(vdupq_n_u32(h32[k0]));
+            const int8x16_t i1 = vreinterpretq_s8_u32(vdupq_n_u32(h32[k1]));
+            const std::int8_t* w0 = W + static_cast<std::size_t>(k0) * 128;
+            const std::int8_t* w1 = W + static_cast<std::size_t>(k1) * 128;
+            a0 = vdotq_s32(a0, vld1q_s8(w0),      i0);  c0 = vdotq_s32(c0, vld1q_s8(w1),      i1);
+            a1 = vdotq_s32(a1, vld1q_s8(w0 + 16), i0);  c1 = vdotq_s32(c1, vld1q_s8(w1 + 16), i1);
+            a2 = vdotq_s32(a2, vld1q_s8(w0 + 32), i0);  c2 = vdotq_s32(c2, vld1q_s8(w1 + 32), i1);
+            a3 = vdotq_s32(a3, vld1q_s8(w0 + 48), i0);  c3 = vdotq_s32(c3, vld1q_s8(w1 + 48), i1);
+            a4 = vdotq_s32(a4, vld1q_s8(w0 + 64), i0);  c4 = vdotq_s32(c4, vld1q_s8(w1 + 64), i1);
+            a5 = vdotq_s32(a5, vld1q_s8(w0 + 80), i0);  c5 = vdotq_s32(c5, vld1q_s8(w1 + 80), i1);
+            a6 = vdotq_s32(a6, vld1q_s8(w0 + 96), i0);  c6 = vdotq_s32(c6, vld1q_s8(w1 + 96), i1);
+            a7 = vdotq_s32(a7, vld1q_s8(w0 + 112), i0); c7 = vdotq_s32(c7, vld1q_s8(w1 + 112), i1);
+        }
+        if (j < nnz) {
+            const int k0 = nz[j];
+            const int8x16_t i0 = vreinterpretq_s8_u32(vdupq_n_u32(h32[k0]));
+            const std::int8_t* w0 = W + static_cast<std::size_t>(k0) * 128;
+            a0 = vdotq_s32(a0, vld1q_s8(w0),      i0);  a1 = vdotq_s32(a1, vld1q_s8(w0 + 16), i0);
+            a2 = vdotq_s32(a2, vld1q_s8(w0 + 32), i0);  a3 = vdotq_s32(a3, vld1q_s8(w0 + 48), i0);
+            a4 = vdotq_s32(a4, vld1q_s8(w0 + 64), i0);  a5 = vdotq_s32(a5, vld1q_s8(w0 + 80), i0);
+            a6 = vdotq_s32(a6, vld1q_s8(w0 + 96), i0);  a7 = vdotq_s32(a7, vld1q_s8(w0 + 112), i0);
+        }
+        alignas(16) std::int32_t sum[32];
+        vst1q_s32(sum,      vaddq_s32(a0, c0));  vst1q_s32(sum + 4,  vaddq_s32(a1, c1));
+        vst1q_s32(sum + 8,  vaddq_s32(a2, c2));  vst1q_s32(sum + 12, vaddq_s32(a3, c3));
+        vst1q_s32(sum + 16, vaddq_s32(a4, c4));  vst1q_s32(sum + 20, vaddq_s32(a5, c5));
+        vst1q_s32(sum + 24, vaddq_s32(a6, c6));  vst1q_s32(sum + 28, vaddq_s32(a7, c7));
+        const float* bias = n.l1b.data() + b * L2;
+        for (int o = 0; o < 32; ++o) x1[o] = screlu(static_cast<float>(sum[o]) / DEQ + bias[o]);
+    } else
     // NEON campaign N5 (A1-analog): 4 outputs per pass, each on TWO independent vdotq chains --
     // 8 dot chains in flight instead of one serial 32-op chain per output (latency-bound), and
     // every h8 vector is loaded once for 4 outputs. Integer sums are order-independent and
@@ -1806,6 +2660,62 @@ Value eval_quant_t(const Board& board) {
         }
     }
 #elif defined(__AVX2__)
+    if (SC_NPS_S1 && L2 == 32 && (hl & 31) == 0 && !n.l1w_sp.empty()) {
+        // S1 sparse L1 on AVX2: list the nonzero 4-byte chunks of h8 (8 per compare, one LUT store,
+        // no branch), then per chunk broadcast its 4 inputs and add them x all 32 outputs: maddubs
+        // (u8 h8 <= 127 x s8 weight; a pair sum is at most 2*127*128 = 32512, no int16 saturation)
+        // + madd(., 1) -> 8 int32 outputs per vector, 4 vectors. Two accumulator sets alternate
+        // chunks. Zero chunks add exactly 0 and int32 sums are order-independent, so every output is
+        // the dense kernel's integer; the epilogue is the same IEEE ops per lane.
+        alignas(32) std::uint16_t nz[MAX_HL / 4 + 8];
+        int nnz = 0;
+        const __m256i zero = _mm256_setzero_si256();
+        __m128i base = _mm_setzero_si128();
+        const __m128i eight = _mm_set1_epi16(8);
+        for (int i = 0; i < hl; i += 32) {
+            const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(h8 + i));
+            const unsigned m = ~static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(h, zero)))) & 0xFFu;
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(nz + nnz),
+                             _mm_add_epi16(base, _mm_load_si128(reinterpret_cast<const __m128i*>(kNnzLut8[m].data()))));
+            nnz += __builtin_popcount(m);
+            base = _mm_add_epi16(base, eight);
+        }
+        const std::int8_t* W = n.l1w_sp.data() + static_cast<std::size_t>(b) * (hl / 4) * 128;
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        auto in4 = [&](int k) { std::int32_t v; std::memcpy(&v, h8 + 4 * k, 4); return _mm256_set1_epi32(v); };
+        auto wv = [](const std::int8_t* p) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)); };
+        auto dp = [&](__m256i acc, __m256i in, const std::int8_t* w) {
+            return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(in, wv(w)), ones16));
+        };
+        __m256i a0 = zero, a1 = zero, a2 = zero, a3 = zero, c0 = zero, c1 = zero, c2 = zero, c3 = zero;
+        int j = 0;
+        for (; j + 2 <= nnz; j += 2) {
+            const int k0 = nz[j], k1 = nz[j + 1];
+            const __m256i i0 = in4(k0), i1 = in4(k1);
+            const std::int8_t* w0 = W + static_cast<std::size_t>(k0) * 128;
+            const std::int8_t* w1 = W + static_cast<std::size_t>(k1) * 128;
+            a0 = dp(a0, i0, w0);      c0 = dp(c0, i1, w1);
+            a1 = dp(a1, i0, w0 + 32); c1 = dp(c1, i1, w1 + 32);
+            a2 = dp(a2, i0, w0 + 64); c2 = dp(c2, i1, w1 + 64);
+            a3 = dp(a3, i0, w0 + 96); c3 = dp(c3, i1, w1 + 96);
+        }
+        if (j < nnz) {
+            const int k0 = nz[j];
+            const __m256i i0 = in4(k0);
+            const std::int8_t* w0 = W + static_cast<std::size_t>(k0) * 128;
+            a0 = dp(a0, i0, w0);      a1 = dp(a1, i0, w0 + 32);
+            a2 = dp(a2, i0, w0 + 64); a3 = dp(a3, i0, w0 + 96);
+        }
+        const __m256i s[4] = {_mm256_add_epi32(a0, c0), _mm256_add_epi32(a1, c1),
+                              _mm256_add_epi32(a2, c2), _mm256_add_epi32(a3, c3)};
+        const float* bias = n.l1b.data() + b * L2;
+        for (int q = 0; q < 4; ++q) {   // the dense kernel's epilogue (A7), 8 lanes at a time
+            __m256 v = _mm256_add_ps(_mm256_div_ps(_mm256_cvtepi32_ps(s[q]), _mm256_set1_ps(DEQ)),
+                                     _mm256_loadu_ps(bias + 8 * q));
+            v = _mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(1.0f));
+            _mm256_storeu_ps(x1 + 8 * q, _mm256_mul_ps(v, v));
+        }
+    } else
     // AVX2 counterpart of the sdot path. h8 is in [0,QA]=[0,127], i.e. a valid UNSIGNED
     // byte, and l1w_dot is signed int8: VPMADDUBSW (u8*s8, adjacent pairs summed into
     // int16) then VPMADDWD (int16 pairs -> int32). Saturation is impossible: a pair sum
@@ -1870,41 +2780,50 @@ Value eval_quant_t(const Board& board) {
 
 }  // namespace
 
-Value evaluate(const Board& board) {
-    return g_net.quant ? eval_quant_t<false>(board) : eval_float_t<false>(board);
+Value evaluate(Context& cx, const Board& board) {
+    return g_net.quant ? eval_quant_t<false>(cx, board) : eval_float_t<false>(cx, board);
 }
 
-Value evaluate_pass(const Board& board) {
-    return g_net.quant ? eval_quant_t<true>(board) : eval_float_t<true>(board);
+Value evaluate_pass(Context& cx, const Board& board) {
+    return g_net.quant ? eval_quant_t<true>(cx, board) : eval_float_t<true>(cx, board);
 }
 
 // ---- incremental accumulator hooks (called by search) -----------------------
-void acc_reset(const Board& board) {
-    if (!g_net.loaded) { g_ply = -1; return; }
-    if (g_bb.empty()) g_bb.resize(ACC_STACK);
-    g_ply = 0;
-    if (g_net.quant) {
-        if (g_stack.empty()) g_stack.resize(ACC_STACK);
-        refresh_into(g_stack[0], board);
-    } else {  // float labeler: fixed-point incremental accumulator
-        if (g_stack_fx.empty()) g_stack_fx.resize(ACC_STACK);
-        refresh_into_fx(g_stack_fx[0], board);
+void acc_reset(Context& cx, const Board& board) {
+    if (!g_net.loaded) { cx.ply = -1; return; }
+    if (cx.finny_gen != g_net_gen) {   // K1: cached sums belong to the previous net
+        for (auto& p : cx.finny) for (auto& f : p) for (auto& e : f) e.valid = false;
+        cx.finny_gen = g_net_gen;
     }
-    g_bb[0] = BB(board);
+    if (cx.bb.empty()) cx.bb.resize(ACC_STACK);
+    cx.ply = 0;
+    if (g_net.quant) {
+        if (cx.stack.empty()) cx.stack.resize(ACC_STACK);
+        refresh_into(cx.stack[0], board);
+    } else {  // float labeler: fixed-point incremental accumulator
+        if (cx.stack_fx.empty()) cx.stack_fx.resize(ACC_STACK);
+        refresh_into_fx(cx.stack_fx[0], board);
+        if constexpr (SC_FX_LAZY) {
+            if (cx.fx_ok.empty()) { cx.fx_ok.resize(ACC_STACK); cx.fx_pend.resize(ACC_STACK); }
+            cx.fx_ok[0] = 1;
+        }
+    }
+    cx.bb[0] = BB(board);
 }
 
 // Incremental delta, templated on accumulator/weight type so the intricate delta
 // logic lives once. Quant instantiates <Acc,int8> (byte-identical to before, guarded
 // by verify_acc); the float labeler instantiates <AccFx,int32> (fixed-point).
 template <class AccT, class WT>
-void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
+void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_stk,
                 const WT* l0, void (*refresh_fn)(AccT&, const Board&)) {
     constexpr bool FX = (sizeof(WT) != 1);  // int32 fixed-point float vs int8 quant
-    g_threats_made = 0;                     // item #9: per-move, so reset on every entry
-    if (g_ply < 0 || g_ply + 1 >= ACC_STACK) { g_ply = -1; return; }
+    constexpr bool LZ = FX && SC_FX_LAZY;   // FXZ: the float path defers its column passes
+    cx.threats_made = 0;                     // item #9: per-move, so reset on every entry
+    if (cx.ply < 0 || cx.ply + 1 >= ACC_STACK) { cx.ply = -1; return; }
     const int hl = g_net.hl;
-    AccT& cur = g_stk[g_ply];
-    AccT& nxt = g_stk[g_ply + 1];
+    AccT& cur = g_stk[cx.ply];
+    AccT& nxt = g_stk[cx.ply + 1];
     // fused-apply dispatch: int8/int16 (quant) vs int32/int32 (fixed-point float).
     auto fused = [&](auto* acc, const WT* const* add, int na, const WT* const* sub, int ns) {
         if constexpr (FX) fused_apply_fx(acc, add, na, sub, ns, hl);
@@ -1942,6 +2861,12 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
     } else {
         special = false;
     }
+#ifdef SC_LZSTAT
+    if (m.typeOf() == Move::CASTLING) ++g_lz_kind[0];
+    else if (m.typeOf() == Move::PROMOTION) ++g_lz_kind[1];
+    else if (m.typeOf() == Move::ENPASSANT) ++g_lz_kind[2];
+    else if (mt0 == 5) ++g_lz_kind[special ? 3 : king_rebucket ? 4 : 5];
+#endif
     if (special) {
         // G8: make the move on the caller's own board and unmake it after the refresh,
         // instead of copying the Board (which deep-copies its undo stack) per refresh.
@@ -1950,8 +2875,9 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         Board& b = const_cast<Board&>(before);
         b.makeMove(m);
         refresh_fn(nxt, b);
-        g_bb[g_ply + 1] = BB(b);  // keep the incremental BB chain in sync
+        cx.bb[cx.ply + 1] = BB(b);  // keep the incremental BB chain in sync
         b.unmakeMove(m);
+        if constexpr (LZ) cx.fx_ok[cx.ply + 1] = 1;
     } else {
         // Single pass (x86 campaign G4, +3.7% all phases): the base columns are deferred into
         // the threat add/sub lists and ONE src->dst fused pass per perspective reads cur and
@@ -1960,6 +2886,10 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         // The float labeler takes the same single pass (int32 sums -> bit-identical; self-play
         // campaign FX2). The NODIRECT probe is int16-only, so FX ignores g_direct here.
         const bool single_pass = (FX || g_direct) && !g_no_update && !g_no_cols;
+        if constexpr (LZ) {
+            cx.fx_ok[cx.ply + 1] = 1;               // computed unless the column pass below is deferred
+            if (!single_pass) fx_ensure(cx, cx.ply);   // the probes read cur up front
+        }
         if (!single_pass) {
             std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
             std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
@@ -1982,16 +2912,16 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         // ---- threat + pp delta (exact: collect before/after feature sets over
         // the affected pieces, then apply only the multiset difference) ----
         // Incremental board bitboards: the before-state is already on the stack
-        // (g_bb[g_ply]), so bb0 is a reference -- no BB rebuild from board.at().
+        // (cx.bb[cx.ply]), so bb0 is a reference -- no BB rebuild from board.at().
         // Form the after-move child directly in the next slot.
-        const BB& bb0 = g_bb[g_ply];
-        BB& bb1 = g_bb[g_ply + 1];
+        const BB& bb0 = cx.bb[cx.ply];
+        BB& bb1 = cx.bb[cx.ply + 1];
         if (g_verify) {  // the stack BB must equal a fresh recompute of `before`
             BB chk(before);
             if (bb0.occ != chk.occ || bb0.wk != chk.wk || bb0.bk != chk.bk
                 || std::memcmp(bb0.by, chk.by, sizeof(chk.by)) != 0
                 || std::memcmp(bb0.piece_on, chk.piece_on, sizeof(chk.piece_on)) != 0)
-                std::fprintf(stderr, "[nnue] BB MISMATCH ply=%d\n", g_ply);
+                std::fprintf(stderr, "[nnue] BB MISMATCH ply=%d\n", cx.ply);
         }
         bb1 = bb0;  // copy parent state, then apply the move in place
         const int sf_moved = (mcolor << 3) | (mt0 + 1);
@@ -2001,7 +2931,7 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         bb1.piece_on[to] = static_cast<std::int8_t>(sf_moved);
         bb1.occ = (bb0.occ & ~(1ull << from)) | (1ull << to);
         if (mt0 == 5) { if (mcolor == 0) bb1.wk = to; else bb1.bk = to; }  // king moved
-        if (g_no_update) { g_ply++; return; }  // cost probe: skip the delta (BB kept)
+        if (g_no_update) { cx.ply++; return; }  // cost probe: skip the delta (BB kept)
         const int wo = orient_tbl(bb0.wk);       // white perspective (swap 0)
         const int bo = orient_tbl(bb0.bk) ^ 56;  // black perspective (swap 8)
 
@@ -2015,17 +2945,28 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         // emitted directly; each slider emits its exact a0^a1 ray change (plus the
         // from/to identity flip). Every emitted column is a real change.
         const std::size_t bd = g_net.base_dims;
-        static thread_local const WT* addp[2][1024];
-        static thread_local const WT* subp[2][1024];
+        const WT* (&addp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.addp);
+        const WT* (&subp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.subp);
         int na[2] = {0, 0}, ns[2] = {0, 0};
+        // P1: every line of a column, issued when the column is known.
+        [[maybe_unused]] auto prefetch_col = [&](const WT* col) {
+            const char* c = reinterpret_cast<const char*>(col);
+            const std::size_t bytes = static_cast<std::size_t>(hl) * sizeof(WT);
+            for (std::size_t off = 0; off < bytes; off += kPfStride) __builtin_prefetch(c + off, 0, SC_NPS_PF_LOC);
+        };
         if (single_pass)   // G4: the base columns ride in the same lists as the threat/pp columns
             for (int p = 0; p < 2; ++p) {
                 addp[p][na[p]++] = base_add[p];
                 subp[p][ns[p]++] = base_sub[p][0];
                 if (cap) subp[p][ns[p]++] = base_sub[p][1];
+                if constexpr (SC_NPS_P1) {
+                    prefetch_col(base_add[p]); prefetch_col(base_sub[p][0]);
+                    if (cap) prefetch_col(base_sub[p][1]);
+                }
             }
         auto push = [&](int p, std::uint32_t idx, bool add) {
             const WT* col = l0 + (bd + idx) * hl;
+            if constexpr (SC_NPS_P1) prefetch_col(col);
             if (add) addp[p][na[p]++] = col; else subp[p][ns[p]++] = col;
         };
         auto emit_threat = [&](int a_sf, int a_sq, int t_sq, int attacked, bool add) {
@@ -2036,7 +2977,7 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
             // and the other excluded pairs map past THREAT_DIMS).
             const std::uint32_t s = make_threat_index(a_sf, a_sq ^ wo, t_sq ^ wo, attacked);
             if (s < (std::uint32_t)THREAT_DIMS) {
-                if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++g_threats_made;
+                if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++cx.threats_made;
                 push(0, s, add);
             }
             const std::uint32_t nn = make_threat_index(a_sf ^ 8, a_sq ^ bo, t_sq ^ bo, attacked ^ 8);
@@ -2137,13 +3078,35 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         if (cap && (cpi % 6) == 0)
             emit_pp(bb0, to, cpi / 6, false, mt0 == 0 ? from : -1);
 
-        if (g_prefetch)
+        if (g_prefetch && !SC_NPS_P1)
             for (int p = 0; p < 2; ++p) {
-                for (int k = 0; k < na[p]; ++k) __builtin_prefetch(addp[p][k]);
-                for (int k = 0; k < ns[p]; ++k) __builtin_prefetch(subp[p][k]);
+                for (int k = 0; k < na[p]; ++k)
+                    for (int t = 0; t < SC_NPS_PF_N; ++t)
+                        __builtin_prefetch(reinterpret_cast<const char*>(addp[p][k]) + t * kPfStride, 0, SC_NPS_PF_LOC);
+                for (int k = 0; k < ns[p]; ++k)
+                    for (int t = 0; t < SC_NPS_PF_N; ++t)
+                        __builtin_prefetch(reinterpret_cast<const char*>(subp[p][k]) + t * kPfStride, 0, SC_NPS_PF_LOC);
             }
         if (!g_no_cols) {  // NOCOLS probe: keep enumeration, skip the column adds
-            if (single_pass) {   // G4: cur -> nxt in one pass (base + threat + pp columns)
+            bool deferred = false;
+            if constexpr (LZ) {   // FXZ: record the lists; a rebucket pass needs nxt now
+                if (single_pass && !king_rebucket && na[0] + ns[0] <= kFxPendCap && na[1] + ns[1] <= kFxPendCap) {
+                    Context::FxPend& e = cx.fx_pend[cx.ply + 1];
+                    for (int p = 0; p < 2; ++p) {
+                        e.na[p] = na[p];
+                        e.ns[p] = ns[p];
+                        std::memcpy(e.col[p], addp[p], static_cast<std::size_t>(na[p]) * sizeof(e.col[p][0]));
+                        std::memcpy(e.col[p] + na[p], subp[p], static_cast<std::size_t>(ns[p]) * sizeof(e.col[p][0]));
+                    }
+                    cx.fx_ok[cx.ply + 1] = 0;
+                    deferred = true;
+                } else if (single_pass) {
+                    fx_ensure(cx, cx.ply);
+                }
+            }
+            if (deferred) {
+                // FXZ: applied on the first read of this ply (fx_ensure)
+            } else if (single_pass) {   // G4: cur -> nxt in one pass (base + threat + pp columns)
                 fused_src(nxt.v[0], cur.v[0], addp[0], na[0], subp[0], ns[0]);
                 fused_src(nxt.v[1], cur.v[1], addp[1], na[1], subp[1], ns[1]);
             } else {
@@ -2207,8 +3170,51 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
         // opponent perspective and all threats/pp were already correct on the
         // incremental path (same mirror -> same orientation; king isn't a threat).
         if (king_rebucket) {
-            static thread_local const WT* ra[40];
-            static thread_local const WT* rs[40];
+          bool rebucketed = false;
+          // With few men the direct form (2 columns per man) is already cheaper than two cache
+          // passes; the caches pay where the board is full.
+          if constexpr (!FX && SC_NPS_K1) if (__builtin_popcountll(bb1.occ) >= SC_NPS_K1_MIN) {
+            rebucketed = true;
+            // Bring the old and the new bucket's cache to the current pieces, then swap them in.
+            const int flip = (file_of(mcolor == 0 ? to : (to ^ 56)) > 3) ? 1 : 0;
+            const int kb_old = king_bucket(mcolor == 0 ? from : (from ^ 56));
+            const int kb_new = king_bucket(mcolor == 0 ? to : (to ^ 56));
+            auto refresh_finny = [&](Context::Finny& e, int ksq) {
+                const WT** ra = reinterpret_cast<const WT**>(cx.ra);
+                const WT** rs = reinterpret_cast<const WT**>(cx.rs);
+                int nra = 0, nrs = 0;
+                if (!e.valid) {
+                    std::memset(e.acc, 0, sizeof(e.acc));
+                    std::memset(e.by, 0, sizeof(e.by));
+                    e.valid = true;
+                }
+                for (int sf = 1; sf < 15; ++sf) {
+                    if ((sf & 7) == 0 || (sf & 7) == 7) continue;
+                    std::uint64_t gone = e.by[sf] & ~bb1.by[sf], added = bb1.by[sf] & ~e.by[sf];
+                    const int c = sf >> 3, t0 = (sf & 7) - 1;
+                    while (gone)  { const int sq = __builtin_ctzll(gone);  gone &= gone - 1;
+                        rs[nrs++] = l0 + (std::size_t)base_feat(mcolor, c, t0, sq, ksq) * hl; }
+                    while (added) { const int sq = __builtin_ctzll(added); added &= added - 1;
+                        ra[nra++] = l0 + (std::size_t)base_feat(mcolor, c, t0, sq, ksq) * hl; }
+                    e.by[sf] = bb1.by[sf];
+                    if (nra > 32 || nrs > 32) {   // flush (the scratch holds 40)
+                        fused(e.acc, ra, nra, rs, nrs);
+                        nra = nrs = 0;
+                    }
+                }
+                if (nra + nrs) fused(e.acc, ra, nra, rs, nrs);
+            };
+            Context::Finny& eo = cx.finny[mcolor][flip][kb_old];
+            Context::Finny& en = cx.finny[mcolor][flip][kb_new];
+            refresh_finny(eo, from);
+            refresh_finny(en, to);
+            std::int16_t* a = nxt.v[mcolor];
+            for (int j = 0; j < hl; ++j)
+                a[j] = static_cast<std::int16_t>(a[j] - eo.acc[j] + en.acc[j]);
+          }
+          if (!rebucketed) {
+            const WT** ra = reinterpret_cast<const WT**>(cx.ra);
+            const WT** rs = reinterpret_cast<const WT**>(cx.rs);
             int nra = 0, nrs = 0;
             std::uint64_t occ = bb1.occ;
             while (occ) {
@@ -2219,22 +3225,31 @@ void acc_make_t(const Board& before, Move m, std::vector<AccT>& g_stk,
                 ra[nra++] = l0 + (std::size_t)base_feat(mcolor, c, t0, sq, to)   * hl;  // new bucket (king@to)
             }
             fused(nxt.v[mcolor], ra, nra, rs, nrs);
+          }
         }
     }
-    g_ply++;
+    cx.ply++;
 }
 
 // Dispatch acc_make to the active accumulator (quant int16 / float fixed-point int32).
-void acc_make(const Board& before, Move m) {
+void acc_make(Context& cx, const Board& before, Move m) {
+#ifdef SC_LZSTAT
+    struct Mark { Context& c; ~Mark() { if (c.ply > 0) { c.lz_needed[c.ply] = 0; ++g_lz_upd; } } } mark{cx};
+#endif
     if (g_net.quant)
-        acc_make_t<Acc, std::int8_t>(before, m, g_stack, g_net.l0w_i8.data(), refresh_into);
+        acc_make_t<Acc, std::int8_t>(cx, before, m, cx.stack, g_net.l0w_i8.data(), refresh_into);
     else
-        acc_make_t<AccFx, std::int32_t>(before, m, g_stack_fx, g_net.l0w_fx.data(), refresh_into_fx);
+        acc_make_t<AccFx, std::int32_t>(cx, before, m, cx.stack_fx, g_net.l0w_fx_p, refresh_into_fx);
 }
 
-void acc_unmake() { if (g_ply > 0) g_ply--; }
+void acc_unmake(Context& cx) {
+#ifdef SC_LZSTAT
+    if (cx.ply > 0 && !cx.lz_needed[cx.ply]) ++g_lz_skip;
+#endif
+    if (cx.ply > 0) cx.ply--;
+}
 
-void acc_clear() { g_ply = -1; }
+void acc_clear(Context& cx) { cx.ply = -1; }
 
 // Accumulator units read by acc_delta_l1: a CONTIGUOUS PREFIX of each perspective, not all of them.
 // The full 1024-unit norm measured -3.395% nps with the tree held identical
@@ -2249,20 +3264,20 @@ void acc_clear() { g_ply = -1; }
 #define SC_ACCSIG_UNITS 128
 #endif
 
-int acc_threats_made() noexcept { return g_net.quant ? g_threats_made : 0; }
+int acc_threats_made(const Context& cx) noexcept { return g_net.quant ? cx.threats_made : 0; }
 
-int acc_delta_l1() noexcept {
+int acc_delta_l1(const Context& cx) noexcept {
     // Item #8 (novelty ledger): the magnitude of the feature-column change a move makes.
     // A quiet move swaps two columns per perspective, so this is ||W[to] - W[from]||_1 read
     // off the accumulator stack rather than recomputed -- the values are already resident,
     // which is what makes the signal cheap. Both perspectives are summed because the mover's
     // piece changes square in both halves' feature sets.
-    if (g_ply < 1 || !g_net.quant) return 0;
+    if (cx.ply < 1 || !g_net.quant) return 0;
     const int hl = g_net.hl;
-    const std::int16_t* c0 = g_stack[g_ply].v[0];
-    const std::int16_t* p0 = g_stack[g_ply - 1].v[0];
-    const std::int16_t* c1 = g_stack[g_ply].v[1];
-    const std::int16_t* p1 = g_stack[g_ply - 1].v[1];
+    const std::int16_t* c0 = cx.stack[cx.ply].v[0];
+    const std::int16_t* p0 = cx.stack[cx.ply - 1].v[0];
+    const std::int16_t* c1 = cx.stack[cx.ply].v[1];
+    const std::int16_t* p1 = cx.stack[cx.ply - 1].v[1];
     const int n = hl < SC_ACCSIG_UNITS ? hl : SC_ACCSIG_UNITS;
     int sum = 0;
     for (int j = 0; j < n; ++j)
@@ -2270,19 +3285,43 @@ int acc_delta_l1() noexcept {
     return sum;
 }
 
-void acc_make_null() {
-    if (g_ply < 0 || g_ply + 1 >= ACC_STACK) { g_ply = -1; return; }
+void acc_make_null(Context& cx) {
+    if (cx.ply < 0 || cx.ply + 1 >= ACC_STACK) { cx.ply = -1; return; }
     const int hl = g_net.hl;
     if (g_net.quant) {
-        std::memcpy(g_stack[g_ply + 1].v[0], g_stack[g_ply].v[0], hl * sizeof(std::int16_t));
-        std::memcpy(g_stack[g_ply + 1].v[1], g_stack[g_ply].v[1], hl * sizeof(std::int16_t));
+        std::memcpy(cx.stack[cx.ply + 1].v[0], cx.stack[cx.ply].v[0], hl * sizeof(std::int16_t));
+        std::memcpy(cx.stack[cx.ply + 1].v[1], cx.stack[cx.ply].v[1], hl * sizeof(std::int16_t));
+    } else if constexpr (SC_FX_LAZY) {   // FXZ: an empty column list = the copy, made on first read
+        Context::FxPend& e = cx.fx_pend[cx.ply + 1];
+        e.na[0] = e.na[1] = e.ns[0] = e.ns[1] = 0;
+        cx.fx_ok[cx.ply + 1] = 0;
     } else {
-        std::memcpy(g_stack_fx[g_ply + 1].v[0], g_stack_fx[g_ply].v[0], hl * sizeof(std::int32_t));
-        std::memcpy(g_stack_fx[g_ply + 1].v[1], g_stack_fx[g_ply].v[1], hl * sizeof(std::int32_t));
+        std::memcpy(cx.stack_fx[cx.ply + 1].v[0], cx.stack_fx[cx.ply].v[0], hl * sizeof(std::int32_t));
+        std::memcpy(cx.stack_fx[cx.ply + 1].v[1], cx.stack_fx[cx.ply].v[1], hl * sizeof(std::int32_t));
     }
-    g_bb[g_ply + 1] = g_bb[g_ply];  // piece placement unchanged by a null move
-    g_ply++;
+    cx.bb[cx.ply + 1] = cx.bb[cx.ply];  // piece placement unchanged by a null move
+    cx.ply++;
+#ifdef SC_LZSTAT
+    cx.lz_needed[cx.ply] = 0; ++g_lz_null;
+#endif
 }
-void acc_unmake_null() { if (g_ply > 0) g_ply--; }
+void acc_unmake_null(Context& cx) {
+#ifdef SC_LZSTAT
+    if (cx.ply > 0 && !cx.lz_needed[cx.ply]) ++g_lz_null_skip;
+#endif
+    if (cx.ply > 0) cx.ply--;
+}
+
+// Context-free forms: the calling thread's own context (UCI debug commands, tools).
+Value evaluate(const Board& board) { return evaluate(tl_context(), board); }
+Value evaluate_pass(const Board& board) { return evaluate_pass(tl_context(), board); }
+void acc_reset(const Board& board) { acc_reset(tl_context(), board); }
+void acc_make(const Board& before, Move m) { acc_make(tl_context(), before, m); }
+void acc_unmake() { acc_unmake(tl_context()); }
+void acc_clear() { acc_clear(tl_context()); }
+void acc_make_null() { acc_make_null(tl_context()); }
+void acc_unmake_null() { acc_unmake_null(tl_context()); }
+int acc_threats_made() noexcept { return acc_threats_made(tl_context()); }
+int acc_delta_l1() noexcept { return acc_delta_l1(tl_context()); }
 
 }  // namespace engine::nnue

@@ -4,6 +4,63 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.6.0 — 2026-10-19
+
+- Self-reports: `SimpleChess 3.6.0`
+- Source VERSION at save time: `3.6.0`
+
+### Strength
+
+Pentanomial SPRT at 10+0.1, one thread per engine, paired openings:
+
+| Comparison | Elo (95%) | Pairs |
+|---|---|---|
+| Code only: 3.6.0 vs 3.5.0, both on the new network | +51 [+39, +62] | 420 |
+| Network only: SCNNUEv3-2026-10-15 vs SCNNUEv3-2026-10-03, both on the 3.6.0 engine | +16 [+10, +22] | 1521 |
+| Code + network: 3.6.0 vs the 3.5.0 release | +69 [+55, +82] | 362 |
+
+### Search
+
+- 41 search constants are tuned: the razoring, reverse-futility, null-move, ProbCut, singular-extension,
+  futility and SEE pruning margins and depth limits, the late-move reduction and late-move pruning terms,
+  the history bonus and malus, the correction-history weights, the aspiration window and the adaptive
+  search width. Tuned by SPSA self-play in two rounds of 20,000 game pairs at 5+0.05.
+- Search threads run on 16 MB stacks: a search past about 150 plies could overflow the default thread
+  stack and crash.
+
+### Speed
+
+The same search runs faster: +19.9% nodes per second on Apple Silicon and +27.6% on x86-64 AVX2 (one
+thread). Every speed change leaves the node counts unchanged, so the engine plays exactly as it would
+without them, only sooner.
+
+- The first hidden layer is computed over its nonzero inputs only, and on x86 the second and third
+  layers too.
+- Faster move-picker selection; knight and king attacks from tables; per-thread network state instead
+  of thread-local lookups; caches for king moves that change the input bucket; network-weight prefetching
+  tuned per architecture; no runtime divisions in the late-move pruning limit or the output-bucket choice.
+- On x86, clearing the hash for a new game no longer rewrites the whole table.
+
+### UCI
+
+- New option `NormalizeScore` (default true): the reported `cp` score is normalized with the
+  win/draw/loss model, so that 100 cp means a 50% win chance for the side to move at the position's
+  material. The raw score at which a win is as likely as not is about 5.8 pawns in bare endgames and
+  1.5 pawns with a full board, so a normalized score reads smaller than the raw one, the more so with less
+  material.
+  Mates and tablebase scores are unchanged. Set it to false for the raw search score.
+- The win/draw/loss model behind `UCI_ShowWDL` and `NormalizeScore` is re-fitted on 151 million
+  positions from the engine's own depth-9 self-play with the shipped network (the 3.4.0 model was
+  preliminary). The chances are computed from the raw score either way.
+
+### Network: SCNNUEv3-2026-10-15
+
+`nets/SCNNUEv3-2026-10-15.scn5` replaces `SCNNUEv3-2026-10-03`. Same architecture; the training set adds
+14.6 million drawn endgame positions with a material imbalance (3 to 7 men, judged drawn by tablebases or
+a deep search, then played out in self-play), for 3.18 billion positions in all. Before the move that
+lost a drawn position, plies are labelled as draws, and draw labels keep 20% of their search score.
+70 superbatches of ~100M positions, eval/result blend 0.8 → 0.7.
+
 ## v3.5.0 — 2026-10-06
 
 - Self-reports: `SimpleChess 3.5.0`

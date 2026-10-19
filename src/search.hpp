@@ -35,9 +35,14 @@
 #include <thread>
 #include <vector>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 #include "history.hpp"
+#include "nnue.hpp"
 #include "timeman.hpp"
 #include "tt.hpp"
 
@@ -176,11 +181,62 @@
 #ifndef SC_TREE_REP
 #define SC_TREE_REP 1
 #endif
+// SC_R50KEY (3.6 fortress work, default 0 = 3.5 behaviour, node-identical): the TT key carries a
+// 50-move-clock bucket (clock < 14 -> 0, then one bucket per 8 plies), so stored scores and evals
+// are reused only near the clock they were computed at. Fortress at d31: -1593 frozen -> -1445.
+// SPRT vs 3.5.0 (10+0.1, [-3,+1]) stopped by hand at 2821 pairs: -0 Elo [-4,+4], LLR +0.76, no
+// verdict -- left off. See dev-notes/campaigns/fortress-3.6.
+#ifndef SC_R50KEY
+#define SC_R50KEY 0
+#endif
 #include "types.hpp"
 
 namespace engine {
 
 class Search;
+
+// A search thread with a stack large enough for the deepest line (MAX_PLY plies of negamax and
+// qsearch frames, a few KB each). std::thread cannot set a stack size, and a secondary thread gets
+// only 512 KB on macOS -- a search line past ~150 plies overflowed it (SIGBUS). POSIX threads are
+// created with kStackBytes; on Windows a new thread already takes the executable's stack reserve.
+class SearchThread {
+   public:
+    static constexpr std::size_t kStackBytes = 16u << 20;  // reserved, committed only as touched
+
+    explicit SearchThread(std::function<void()> fn) : fn_(std::move(fn)) {
+#if !defined(_WIN32)
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, kStackBytes);
+        native_ = pthread_create(&tid_, &attr, &SearchThread::entry, this) == 0;
+        pthread_attr_destroy(&attr);
+        if (native_) return;
+#endif
+        thread_ = std::thread([this] { fn_(); });  // Windows, or pthread_create failed
+    }
+    SearchThread(const SearchThread&)            = delete;
+    SearchThread& operator=(const SearchThread&) = delete;
+    ~SearchThread() { join(); }
+
+    void join() {
+#if !defined(_WIN32)
+        if (native_) { pthread_join(tid_, nullptr); native_ = false; return; }
+#endif
+        if (thread_.joinable()) thread_.join();
+    }
+
+   private:
+#if !defined(_WIN32)
+    static void* entry(void* self) {
+        static_cast<SearchThread*>(self)->fn_();
+        return nullptr;
+    }
+    pthread_t tid_{};
+    bool      native_ = false;
+#endif
+    std::function<void()> fn_;
+    std::thread           thread_;
+};
 
 // Set the root-move noise magnitude in centipawns (0 = off, normal play). Used
 // by the self-play data generator to diversify games; see search.cpp.
@@ -189,6 +245,7 @@ void set_root_noise(int cp);
 // UCI_ShowWDL: add "wdl W D L" (win/draw/loss per mille for the side to move, from the model in
 // wdl.hpp) to every scored info line. Display only; takes effect from the next report.
 void set_show_wdl(bool on);
+void set_cp_norm(bool on);   // NormalizeScore: off = raw internal cp (tools that read scores as data)
 
 // Silence all UCI output (info/bestmove) from the search. Used by the in-engine
 // game generator (`gengame`) so its many per-ply searches don't spam stdout.
@@ -276,6 +333,9 @@ class Worker {
     int     id_;
 
     History history_;
+
+    // This worker's NNUE accumulator stacks (passed to every nnue call: no thread-local lookups).
+    nnue::ContextPtr nn_{nnue::context_new()};
 
     // Relaxed atomic: each worker only writes its own counter (its own cache
     // line); readers (limit checks, info lines) sum across workers.
@@ -376,7 +436,7 @@ class Search {
     TranspositionTable& tt_;
 
     std::vector<std::unique_ptr<Worker>> workers_;
-    std::vector<std::thread>             threads_;
+    std::vector<std::unique_ptr<SearchThread>> threads_;
     // F1: threads_ holds a PERSISTENT pool (spawned in set_threads, joined on shutdown)
     // instead of per-go threads. start() signals the pool; wait() blocks on completion.
     // Avoids creating threads and first-touching each worker's ~1 MB thread_local

@@ -122,14 +122,24 @@ std::size_t TranspositionTable::resize(std::size_t mb) {
         if (p) {
             clusters_      = static_cast<Cluster*>(p);
             cluster_count_ = count;
-            clear();
+            wipe();
             return mb;
         }
     }
 }
 
-void TranspositionTable::clear() {
+void TranspositionTable::wipe() noexcept {
     if (clusters_) std::memset(clusters_, 0, cluster_count_ * sizeof(Cluster));
+    generation_ = 0;
+    epoch_      = 0;
+}
+
+// TTE: instead of writing the whole table (256 MB per self-play game, and an L3 flush for every
+// other process), a clear advances the epoch; every probe and store first zeroes a cluster from an
+// older epoch (fresh()), so each cluster is read exactly as the memset would have left it.
+void TranspositionTable::clear() {
+    if (!SC_TT_EPOCH || static_cast<std::uint16_t>(epoch_ + 1) == 0) { wipe(); return; }
+    ++epoch_;
     generation_ = 0;
 }
 
@@ -144,6 +154,7 @@ TTProbe TranspositionTable::probe(Key key) {
 
     Cluster&            c   = clusters_[cluster_index(key)];
     const std::uint16_t tag = tag_of(key);
+    fresh(c);
 
     TTEntry* victim = &c.entry[0];
     int      worst  = keep_priority(c.entry[0]);
@@ -162,6 +173,7 @@ void TranspositionTable::store(Key key, Value value, Value eval, Bound bound, De
 
     Cluster&            c   = clusters_[cluster_index(key)];
     const std::uint16_t tag = tag_of(key);
+    fresh(c);
 
     // Target: a matching-key slot (update in place) or an empty one; otherwise the
     // lowest keep-priority slot in the cluster.
@@ -209,11 +221,13 @@ int TranspositionTable::hashfull() const {
 
     const std::size_t sample = std::min<std::size_t>(cluster_count_, 1000);
     int               used = 0, total = 0;
-    for (std::size_t i = 0; i < sample; ++i)
+    for (std::size_t i = 0; i < sample; ++i) {
+        if (SC_TT_EPOCH && clusters_[i].epoch != epoch_) { total += 3; continue; }   // TTE: reads as zero
         for (const TTEntry& e : clusters_[i].entry) {
             ++total;
             if (e.bound() != Bound::NONE && e.generation() == generation_) ++used;
         }
+    }
     return static_cast<int>(static_cast<std::size_t>(used) * 1000 / total);
 }
 

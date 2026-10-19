@@ -48,9 +48,18 @@ struct TTEntry {
 
 // Three entries per cluster, padded to exactly 32 bytes so a 64-byte-aligned
 // table never splits a cluster across two cache lines.
+// TTE (x86 default 1): the 2 bytes after the entries hold the table epoch the cluster was last
+// zeroed in (see TranspositionTable::clear).
+#ifndef SC_TT_EPOCH
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_TT_EPOCH 1
+#else
+#define SC_TT_EPOCH 0
+#endif
+#endif
 struct Cluster {
-    TTEntry     entry[3];
-    std::uint8_t pad[2] = {0, 0};
+    TTEntry       entry[3];
+    std::uint16_t epoch = 0;
 };
 static_assert(sizeof(TTEntry) == 10, "TTEntry must stay 10 bytes");
 static_assert(sizeof(Cluster) == 32, "Cluster must fill half a cache line");
@@ -109,6 +118,17 @@ class TranspositionTable {
 
     void release() noexcept;
 
+    // TTE: zero every cluster for real (allocation, and the 16-bit epoch wrap).
+    void wipe() noexcept;
+
+    // TTE: a cluster last zeroed in an older epoch reads as all zero -- zero it before use.
+    void fresh(Cluster& c) const noexcept {
+        if (SC_TT_EPOCH && c.epoch != epoch_) {
+            c       = Cluster{};
+            c.epoch = epoch_;
+        }
+    }
+
     Cluster*     clusters_      = nullptr;
     std::size_t  cluster_count_ = 0;
 #if defined(_WIN32)
@@ -116,6 +136,7 @@ class TranspositionTable {
     bool         large_pages_   = false;  // clusters_ came from MEM_LARGE_PAGES
 #endif
     std::uint8_t generation_    = 0;  // low 5 bits are the current search age
+    std::uint16_t epoch_        = 0;  // TTE: bumped by clear()
 };
 
 }  // namespace engine

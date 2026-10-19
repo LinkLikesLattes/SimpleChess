@@ -25,6 +25,8 @@
 #include "io.hpp"
 #include "nnue.hpp"
 #include "syzygy.hpp"
+#include "tune.hpp"
+#include "wdl.hpp"
 
 namespace engine {
 
@@ -185,6 +187,8 @@ void UCI::handle_uci() const {
     std::cout << "option name MultiPV type spin default 1 min 1 max " << MAX_MOVES << "\n";
     std::cout << "option name UCI_Chess960 type check default false\n";
     std::cout << "option name UCI_ShowWDL type check default false\n";
+    // Only when the WDL model normalizes the reported cp (wdl.hpp kCpNorm): off = the raw internal score.
+    if constexpr (kCpNorm) std::cout << "option name NormalizeScore type check default true\n";
     std::cout << "option name Clear Hash type button\n";
     std::cout << "option name OwnBook type check default false\n";
     std::cout << "option name Book File type string default <empty>\n";
@@ -203,6 +207,7 @@ void UCI::handle_uci() const {
     std::cout << "option name BuildTag type string default " << SC_STR(SC_BUILD_TAG) << "\n";
 #endif
     pass_param_options(std::cout);  // Pass* tunables: dev knobs, advertised only in SC_PASS_UCI_OPTIONS builds
+    tune::options(std::cout);       // search tunables: SC_TUNE builds only
     std::cout << "uciok" << std::endl;
 }
 
@@ -335,6 +340,9 @@ void UCI::handle_setoption(std::istringstream& is) {
     } else if (iequals(name, "UCI_ShowWDL")) {
         // Win/draw/loss per mille in the info lines (display only; see wdl.hpp).
         set_show_wdl(iequals(value, "true") || value == "1");
+    } else if (kCpNorm && iequals(name, "NormalizeScore")) {
+        // Reported cp = 100 * v / a(root material) (wdl.hpp normalized_cp); display only.
+        set_cp_norm(iequals(value, "true") || value == "1");
     } else if (iequals(name, "Clear Hash")) {
         search_.stop();
         search_.wait();
@@ -385,6 +393,12 @@ void UCI::handle_setoption(std::istringstream& is) {
         if (const auto v = spin(std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
             v && set_pass_param(name, *v))
             sync_cout << "info string " << name << " = " << *v << sync_endl;
+    } else if (SC_TUNE) {
+        // Search tunables (SC_TUNE builds; see SC_PARAM in tune.hpp). Set between searches only.
+        search_.stop();
+        search_.wait();
+        if (const auto v = spin(std::numeric_limits<int>::min(), std::numeric_limits<int>::max()))
+            tune::set(name, *v);
     }
     // Unknown options are silently ignored per the protocol.
 }
@@ -556,10 +570,10 @@ void UCI::handle_gengame(std::istringstream& is) {
     search_.wait();  // the silent flag goes up
     set_gen_silent(true);
     for (int ply = 0; ply < maxplies; ++ply) {
-        // Stop at exactly the draws python-chess's is_game_over(claim_draw=True) claims
-        // (threefold / fifty-move / insufficient material) -- same predicates the search
-        // uses (search.cpp) -- so gengame performs the SAME number of searches as the old
-        // per-ply loop and leaves the shared TT in the same state (byte-identical labels).
+        // Stop at exactly the draws train/selfplay.py ends a game on (the third occurrence of
+        // the position, 100 plies without a capture or pawn move, insufficient material) --
+        // same predicates the search uses (search.cpp) -- so gengame performs the SAME number
+        // of searches as the old per-ply loop and leaves the shared TT in the same state.
         if (board.isRepetition(2) || board.isHalfMoveDraw() || board.isInsufficientMaterial())
             break;
         search_.start(board, limits);

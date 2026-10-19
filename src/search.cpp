@@ -41,8 +41,22 @@
 #include "nnue.hpp"
 #include "see.hpp"
 #include "syzygy.hpp"
+#include "tune.hpp"
 #include "io.hpp"
 #include "wdl.hpp"
+
+#ifndef SC_NPS_N1
+#define SC_NPS_N1 1
+#endif
+// ZA: the TT-prefetch key from the inexact zobristAfter<false>. Kept on x86 (i7-9700 +0.36%); on the
+// M1 Max it measured +0.07% over 3 sessions (below the keep line), so other arches keep the exact key.
+#ifndef SC_NPS_ZA
+#if defined(__x86_64__) || defined(_M_X64)
+#define SC_NPS_ZA 1
+#else
+#define SC_NPS_ZA 0
+#endif
+#endif
 
 namespace engine {
 
@@ -53,6 +67,7 @@ namespace engine {
 namespace {
 std::atomic<int>              g_root_noise{0};
 std::atomic<bool>             g_show_wdl{false};     // UCI_ShowWDL: display only (setoption may arrive mid-search)
+std::atomic<bool>             g_cp_norm{true};       // NormalizeScore (only with kCpNorm): reported cp = normalized_cp
 bool                          g_gen_silent = false;  // set before gengame's searches (single UCI thread)
 thread_local std::mt19937_64  t_noise_rng{std::random_device{}()};
 thread_local std::uint64_t    t_noise_seed{0};   // fixed per search (set in think())
@@ -124,6 +139,7 @@ void pass_param_options(std::ostream& out) {
 void set_root_noise(int cp) { g_root_noise.store(cp < 0 ? 0 : cp, std::memory_order_relaxed); }
 
 void set_show_wdl(bool on) { g_show_wdl.store(on, std::memory_order_relaxed); }
+void set_cp_norm(bool on) { g_cp_norm.store(on, std::memory_order_relaxed); }
 
 // Set on the UCI thread before gengame/revgame's searches; the workers observe it through
 // start()'s hand-off (thread creation, or the persistent pool's mutex). Those callers stop and
@@ -151,8 +167,9 @@ namespace {
 }
 
 // ---- Tunables ----------------------------------------------------------------
-// Margins are in centipawns unless noted. These are sane starting points, not
-// tuned values — SPSA them once the evaluation stabilizes.
+// Margins are in centipawns unless noted. SC_PARAM (tune.hpp) makes each a
+// constexpr in a normal build and a UCI spin option in an SC_TUNE build, which is
+// what the SPSA driver (tools/tune/spsa.py) plays; the range is the option's.
 
 // The tn at which the PassTmScale time apportionment leaves the budget unchanged. Started as the
 // median of tn on F1's measured pool (P50(T) 117 - PassTau 45 = 72), but the tn distribution is
@@ -161,23 +178,48 @@ namespace {
 // false PASS. CALIBRATED instead: tools/verify/passeval_tmcheck.py measures mean time consumed over
 // 300 phase-diverse positions under a real clock, and 88 is the value that makes the ratio 1.000.
 constexpr int   kPassTmMid         = 88;
-constexpr Depth kIIRMinDepth       = 4;    // reduce when no TT move at/above this depth
-constexpr Depth kRazorMaxDepth     = 3;    // razoring applies at depth <= this
-constexpr int   kRazorMargin       = 300;  // per-depth margin below alpha
-constexpr Depth kRFPMaxDepth       = 8;    // reverse futility max depth
-constexpr int   kRFPMargin         = 80;   // per-depth margin above beta
-constexpr Depth kNMPMinDepth       = 3;    // null move minimum depth
-constexpr Depth kProbCutMinDepth   = 5;
-constexpr int   kProbCutMargin     = 200;  // beta + margin must be beaten by a capture
-constexpr Depth kSingularMinDepth  = 8;
-constexpr Depth kFutilityMaxDepth  = 10;   // futility pruning of quiets
-constexpr int   kFutilityBase      = 100;
-constexpr int   kFutilityPerDepth  = 120;
-constexpr Depth kSeeGateMaxDepth   = 8;    // SEE pruning applies at depth <= this
-constexpr int   kSeeQuietMargin    = 70;   // quiets must not lose more than this * depth
-constexpr int   kSeeCaptureMargin  = 180;  // captures likewise
-constexpr int   kQsFutilityMargin  = 200;  // qsearch delta-pruning cushion
-constexpr int   kAspirationDelta   = 20;   // initial aspiration half-window
+SC_PARAM(kIIRMinDepth,       4,    2,    10)     // reduce when no TT move at/above this depth
+SC_PARAM(kRazorMaxDepth,     2,    1,    8)      // razoring applies at depth <= this
+SC_PARAM(kRazorMargin,       295,  50,   800)    // per-depth margin below alpha
+SC_PARAM(kRFPMaxDepth,       8,    3,    16)     // reverse futility max depth
+SC_PARAM(kRFPMargin,         90,   20,   200)    // per-depth margin above beta
+SC_PARAM(kRFPImproving,      71,   0,    200)    // margin given back when improving
+SC_PARAM(kNMPMinDepth,       2,    1,    8)      // null move minimum depth
+SC_PARAM(kNMPBase,           3,    1,    8)      // null move reduction: base ...
+SC_PARAM(kNMPDepthDiv,       3,    2,    10)     // ... + depth / this ...
+SC_PARAM(kNMPEvalDiv,        204,  50,   600)    // ... + min(3, (eval - beta) / this)
+SC_PARAM(kProbCutMinDepth,   5,    3,    10)
+SC_PARAM(kProbCutMargin,     197,  50,   500)    // beta + margin must be beaten by a capture
+SC_PARAM(kSingularMinDepth,  7,    4,    14)     // >= 4 keeps depth - 1 + extension >= 1
+SC_PARAM(kSingularBetaMul,   38,   4,    96)     // singular beta = tt value - depth * this / 16
+SC_PARAM(kLmpBase,           7,    0,    12)     // quiet budget (base + d * d * mul / 16) / (2 - improving)
+SC_PARAM(kLmpMul,            19,   4,    40)
+SC_PARAM(kFutilityMaxDepth,  10,   3,    16)     // futility pruning of quiets
+SC_PARAM(kFutilityBase,      103,  0,    300)
+SC_PARAM(kFutilityPerDepth,  116,  30,   300)
+SC_PARAM(kSeeGateMaxDepth,   8,    3,    14)     // SEE pruning applies at depth <= this
+SC_PARAM(kSeeQuietMargin,    58,   10,   200)    // quiets must not lose more than this * depth
+SC_PARAM(kSeeCaptureMargin,  173,  30,   400)    // captures likewise
+SC_PARAM(kQsFutilityMargin,  194,  50,   500)    // qsearch delta-pruning cushion
+SC_PARAM(kAspirationDelta,   15,   5,    80)     // initial aspiration half-window
+// Late move reductions, in 1/1024 ply: the table is base/100 + log(d) log(m) / (div/100),
+// then the per-move terms below are added and the sum truncated to whole plies.
+SC_PARAM(kLmrBase,           70,   -50,  250)
+SC_PARAM(kLmrDiv,            232,  120,  500)
+SC_PARAM(kLmrNotImproving,   1046, 0,    3072)
+SC_PARAM(kLmrCutNode,        1803, 0,    4096)
+SC_PARAM(kLmrPvNode,         1050, 0,    3072)
+SC_PARAM(kLmrGivesCheck,     965 , 0,    3072)
+SC_PARAM(kLmrTactical,       1188, 0,    3072)   // captures and promotions
+SC_PARAM(kLmrHistDiv,        6800, 2048, 32768)  // quiets: minus clamp(ordering score / this, -2, 2) plies
+// History bonus min(mul * depth - sub, max); the malus is the bonus * scale / 1024.
+SC_PARAM(kHistBonusMul,      189,  32,   400)
+SC_PARAM(kHistBonusSub,      76,   0,    400)
+SC_PARAM(kHistBonusMax,      1575, 400,  4000)
+SC_PARAM(kHistMalusScale,    1162, 256,  2048)
+// Correction-history step: (search - static) * depth * this / 1024, with / without a best move.
+SC_PARAM(kCorrUpdBest,       99,   16,   320)
+SC_PARAM(kCorrUpdNoBest,     146,  16,   480)
 
 // ---- Effort-based time scaling (v1.4) ----
 // In a clock game, an obvious move does not deserve the whole budget. The
@@ -220,26 +262,34 @@ constexpr int   kEffortMaxCutPct = 60;  // strongest trim, at a 100% share
 // of 128 is "one full ply" of widening; 0 prunes bit-identically to v0.6.
 // SC_BREADTH (the ceiling, i.e. the aggressiveness) is the sweepable knob.
 #ifndef SC_BREADTH
-#define SC_BREADTH 64  // max width; 0 disables. Sweep winner: 32..160 tested, peak at 64
+#define SC_BREADTH 57  // max width; 0 disables. Sweep winner: 32..160 tested, peak at 64
 #endif
-constexpr int   kBreadthMax        = SC_BREADTH;
-constexpr Value kBreadthGapRange   = 80;   // gap signal fades to 0 here (cp)
-constexpr Value kBreadthScoreRange = 200;  // score signal fades to 0 here (cp)
+SC_PARAM(kBreadthMax,        SC_BREADTH, 0, 192)
+SC_PARAM(kBreadthGapRange,   77,   20,   200)    // gap signal fades to 0 here (cp)
+SC_PARAM(kBreadthScoreRange, 205,  50,   500)    // score signal fades to 0 here (cp)
 // The old third factor (middlegame-ness, "endings = deep") was DROPPED in 3.2:
 // it forced width to 0 from ~Q+R each side on, so every endgame ran the
 // narrowest tree — the strongest engines carry no material term in their
 // reductions at all. See dev-notes/campaigns/search-3.2.
 constexpr Depth kBreadthMinDepth   = 6;    // trust the root gap only from this iteration on
 
-// Late-move-reduction table, indexed [depth][move number]; log-shaped.
-// Built once at startup.
-const auto kLmr = [] {
-    std::array<std::array<std::uint8_t, 64>, 64> t{};
+// Late-move-reduction table in 1/1024 ply, indexed [depth][move number]; log-shaped.
+// Built at startup, and rebuilt when a tuning build changes kLmrBase or kLmrDiv.
+using LmrTable = std::array<std::array<std::int16_t, 64>, 64>;
+[[nodiscard]] LmrTable build_lmr() {
+    LmrTable t{};
     for (int d = 1; d < 64; ++d)
         for (int m = 1; m < 64; ++m)
-            t[d][m] = static_cast<std::uint8_t>(0.77 + std::log(d) * std::log(m) / 2.36);
+            t[d][m] = static_cast<std::int16_t>(
+                1024.0 * (kLmrBase / 100.0 + std::log(d) * std::log(m) / (kLmrDiv / 100.0)));
     return t;
-}();
+}
+#if SC_TUNE
+LmrTable kLmr = build_lmr();
+const bool kLmr_hooked = (tune::on_change([] { kLmr = build_lmr(); }), true);
+#else
+const LmrTable kLmr = build_lmr();
+#endif
 
 // Convert a TT-stored mate or tablebase score (distance counted from the stored node) back to the
 // root-relative form the search uses at `ply`. `r50c` is the position's halfmove clock; with
@@ -282,7 +332,39 @@ const auto kLmr = [] {
         if ((ss - k)->current_move == Move(Move::NULL_MOVE)) return false;
         if (k % 2 == 0 && (ss - k)->key == key) return true;
     }
+    // RD: the library rescans distances 2, 4, .. up to clock + 1 and needs two matches. With the
+    // clock below the ply that window lies in the tree, where the loop above found none at the even
+    // distances up to the clock: at most one match is left (distance clock + 1), so it is false.
+    if (static_cast<int>(board.halfMoveClock()) < ss->ply) return false;
     return board.isRepetition(2);
+}
+
+// SC_R50KEY: the TT key of a position at halfmove clock `hfm` -- the board key XOR a constant per
+// clock bucket (clock < 14 -> bucket 0, which leaves the key unchanged; then one bucket per 8 plies).
+constexpr std::array<Key, 16> kR50Keys = [] {
+    std::array<Key, 16> k{};
+    std::uint64_t x = 0x9E3779B97F4A7C15ULL;
+    for (std::size_t i = 1; i < k.size(); ++i) {
+        x += 0x9E3779B97F4A7C15ULL;
+        std::uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        k[i] = z ^ (z >> 31);
+    }
+    return k;
+}();
+[[nodiscard]] constexpr Key r50_key(Key key, [[maybe_unused]] int hfm) noexcept {
+    if constexpr (SC_R50KEY)
+        return key ^ kR50Keys[hfm < 14 ? 0 : std::min<std::size_t>(15, static_cast<std::size_t>((hfm - 14) / 8 + 1))];
+    return key;
+}
+// The child's TT key after `m`, for the prefetch only: the child's clock is 0 after a capture or pawn
+// move. ZA (x86): the library's inexact zobristAfter<false> (no en-passant / castling-rights terms) -- on
+// the moves where it differs the prefetch fetches another cluster, which cannot change any result.
+[[nodiscard]] Key r50_key_after(const Board& board, Move m) noexcept {
+    if constexpr (!SC_R50KEY) return board.zobristAfter<!SC_NPS_ZA>(m);
+    const bool zeroing = board.isCapture(m) || board.at<PieceType>(m.from()) == PieceType::PAWN;
+    return r50_key(board.zobristAfter<!SC_NPS_ZA>(m), zeroing ? 0 : static_cast<int>(board.halfMoveClock()) + 1);
 }
 
 // A node whose halfmove clock has reached 100 is a 50-move draw, unless the move that reached it
@@ -360,7 +442,8 @@ void Search::start(const Board& root, const SearchLimits& limits) {
 
 #if defined(__ARM_NEON)
     threads_.reserve(workers_.size());   // pre-F1: one fresh std::thread per worker per `go`
-    for (auto& w : workers_) threads_.emplace_back([worker = w.get()] { worker->think(); });
+    for (auto& w : workers_)
+        threads_.push_back(std::make_unique<SearchThread>([worker = w.get()] { worker->think(); }));
 #else
     {
         std::lock_guard<std::mutex> lk(pool_mu_);
@@ -389,8 +472,7 @@ void Search::ponderhit() {
 
 void Search::wait() {
 #if defined(__ARM_NEON)
-    for (auto& t : threads_)
-        if (t.joinable()) t.join();
+    for (auto& t : threads_) t->join();
     threads_.clear();
 #else
     std::unique_lock<std::mutex> lk(pool_mu_);
@@ -404,7 +486,7 @@ void Search::pool_spawn() {
     pool_go_.assign(workers_.size(), static_cast<char>(0));
     threads_.reserve(workers_.size());
     for (std::size_t i = 0; i < workers_.size(); ++i)
-        threads_.emplace_back([this, i] { pool_loop(static_cast<int>(i)); });
+        threads_.push_back(std::make_unique<SearchThread>([this, i] { pool_loop(static_cast<int>(i)); }));
 }
 
 void Search::pool_shutdown() noexcept {
@@ -413,8 +495,7 @@ void Search::pool_shutdown() noexcept {
         pool_quit_ = true;
     }
     pool_start_cv_.notify_all();
-    for (auto& th : threads_)
-        if (th.joinable()) th.join();
+    for (auto& th : threads_) th->join();
     threads_.clear();
 }
 
@@ -501,15 +582,18 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     if (board.isHalfMoveDraw()) return fifty_move_value(board, ss->ply);
 
     const bool in_check = board.inCheck();
-    if (ss->ply >= MAX_PLY) return in_check ? VALUE_DRAW : nnue::evaluate(board);
+    if (ss->ply >= MAX_PLY) return in_check ? VALUE_DRAW : nnue::evaluate(*nn_, board);
 
-    nodes_.fetch_add(1, std::memory_order_relaxed);
+    // N1 (NPS 3.6): only this worker writes its counter, so a relaxed load + store is the same
+    // count without an atomic read-modify-write per node; readers still see a relaxed value.
+    if constexpr (SC_NPS_N1) nodes_.store(nodes_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    else                     nodes_.fetch_add(1, std::memory_order_relaxed);
     seldepth_ = std::max(seldepth_, ss->ply);
 
     (ss + 1)->ply = ss->ply + 1;
 
     // TT probe: qsearch entries are stored at depth 0, so any hit qualifies.
-    const Key     key   = board.hash();
+    const Key     key   = r50_key(board.hash(), static_cast<int>(board.halfMoveClock()));
     const TTProbe probe = pool_.tt_.probe(key);
     Move          tt_move  = Move(Move::NO_MOVE);
     Value         tt_value = VALUE_NONE;
@@ -533,7 +617,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
         if (probe.hit && tt_eval != VALUE_NONE) {
             raw_eval = tt_eval;  // reuse the stored static eval as-is (already damped when written)
         } else {
-            raw_eval = nnue::evaluate(board);
+            raw_eval = nnue::evaluate(*nn_, board);
             if constexpr (SC_R50DAMP)
                 raw_eval -= raw_eval * static_cast<int>(board.halfMoveClock()) / 199;
         }
@@ -546,7 +630,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
             // -- at a null window that band is ~cap*lambda/64 cp wide, so the cost stays bounded.
             const int lam = pass_[PASS_QS_LAMBDA];
             if (lam > 0 && raw_eval > alpha && raw_eval - pass_[PASS_CAP] * lam / 64 < beta) {
-                const int t  = raw_eval - nnue::evaluate_pass(board);
+                const int t  = raw_eval - nnue::evaluate_pass(*nn_, board);
                 const int tq = std::clamp<int>(t - pass_[PASS_TAU], 0, pass_[PASS_CAP]);
                 best = static_cast<Value>(raw_eval - tq * lam / 64);
             }
@@ -570,7 +654,7 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
     ctx.prev2_piece = (ss - 2)->moved_piece;
     ctx.prev2_to    = (ss - 2)->moved_to;
 
-    MovePicker picker(board, history_, ctx, /*captures_only=*/true);
+    MovePicker picker(board, history_, ctx, /*captures_only=*/!in_check);
 
     Move best_move  = Move(Move::NO_MOVE);
     int  move_count = 0;
@@ -611,14 +695,14 @@ Value Worker::qsearch(Board& board, Stack* ss, Value alpha, Value beta) {
 
         // D3: prefetch the child's TT cluster BEFORE the NNUE update so the accumulator
         // work hides the miss (issued after makeMove it led the probe by only a few ns).
-        // zobristAfter() is the library's exact post-move key for the makeMove<false>
-        // the search uses (same en-passant rule); a prefetch cannot change any result.
-        pool_.tt_.prefetch(board.zobristAfter(m));
-        nnue::acc_make(board, m);
+        // r50_key_after() is the child's key (inexact on en-passant / castling-rights moves:
+        // ZA); a prefetch cannot change any result.
+        pool_.tt_.prefetch(r50_key_after(board, m));
+        nnue::acc_make(*nn_, board, m);
         board.makeMove(m);
         const Value score = -qsearch(board, ss + 1, -beta, -alpha);
         board.unmakeMove(m);
-        nnue::acc_unmake();
+        nnue::acc_unmake(*nn_);
 
         if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
@@ -656,7 +740,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     if (!root) {
         if (is_repetition_draw(board, ss) || board.isInsufficientMaterial()) return VALUE_DRAW;
         if (board.isHalfMoveDraw()) return fifty_move_value(board, ss->ply);
-        if (ss->ply >= MAX_PLY) return board.inCheck() ? VALUE_DRAW : nnue::evaluate(board);
+        if (ss->ply >= MAX_PLY) return board.inCheck() ? VALUE_DRAW : nnue::evaluate(*nn_, board);
 
         // Mate distance pruning: the window can't contain mates longer than
         // one we've already proven from the root.
@@ -665,7 +749,10 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         if (alpha >= beta) return alpha;
     }
 
-    nodes_.fetch_add(1, std::memory_order_relaxed);
+    // N1 (NPS 3.6): only this worker writes its counter, so a relaxed load + store is the same
+    // count without an atomic read-modify-write per node; readers still see a relaxed value.
+    if constexpr (SC_NPS_N1) nodes_.store(nodes_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    else                     nodes_.fetch_add(1, std::memory_order_relaxed);
     seldepth_ = std::max(seldepth_, ss->ply);
 
     const bool in_check = board.inCheck();
@@ -678,7 +765,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     // ---- Transposition table ----
     // In a singular verification search the stored entry describes the node
     // *with* the excluded move available, so it must not be consulted at all.
-    const Key     key   = board.hash();
+    const Key     key   = r50_key(board.hash(), static_cast<int>(board.halfMoveClock()));
     const TTProbe probe = (excluded != Move(Move::NO_MOVE)) ? TTProbe{} : pool_.tt_.probe(key);
 
     Move  tt_move  = Move(Move::NO_MOVE);
@@ -730,7 +817,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         if (probe.hit && tt_eval != VALUE_NONE) {
             raw_eval = tt_eval;  // reuse the stored static eval as-is (already damped when written)
         } else {
-            raw_eval = nnue::evaluate(board);
+            raw_eval = nnue::evaluate(*nn_, board);
             if constexpr (SC_R50DAMP)
                 raw_eval -= raw_eval * static_cast<int>(board.halfMoveClock()) / 199;
         }
@@ -783,7 +870,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             if (tension_done) return;
             tension_done = true;
             if (in_check || depth < pass_[PASS_MIN_DEPTH]) return;
-            const Value p = nnue::evaluate_pass(board);
+            const Value p = nnue::evaluate_pass(*nn_, board);
             tension = raw_eval - p;
             tn      = std::clamp<int>(tension - pass_[PASS_TAU], 0, pass_[PASS_CAP]);
             tu      = std::clamp<int>(tension > pass_[PASS_TAU]
@@ -795,15 +882,15 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             // In-search oracle (dev builds only): P must equal the eval of the actual null-moved
             // position through the incremental path, and a TT-supplied raw_eval must equal a fresh
             // query. Any mismatch is a bug, never noise (both are deterministic integer paths).
-            nnue::acc_make_null();
+            nnue::acc_make_null(*nn_);
             board.makeNullMove();
-            const Value p_ref = -nnue::evaluate(board);
+            const Value p_ref = -nnue::evaluate(*nn_, board);
             board.unmakeNullMove();
-            nnue::acc_unmake_null();
+            nnue::acc_unmake_null(*nn_);
             if (p_ref != p)
                 std::fprintf(stderr, "[passeval] P MISMATCH ply=%d p=%d ref=%d\n", ss->ply, int(p), int(p_ref));
             if (probe.hit && tt_eval != VALUE_NONE) {
-                const Value fresh = nnue::evaluate(board);
+                const Value fresh = nnue::evaluate(*nn_, board);
                 if (tt_eval != fresh)
                     std::fprintf(stderr, "[passeval] TT EVAL MISMATCH ply=%d tt=%d fresh=%d\n", ss->ply, int(tt_eval), int(fresh));
             }
@@ -841,7 +928,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         // ---- Reverse futility pruning (static null move) ----
         // So far above beta that a real search is a formality.
         if (depth <= kRFPMaxDepth && !is_mate_score(eval) &&
-            eval - kRFPMargin * (depth - improving) >= beta) {
+            eval - kRFPMargin * depth + kRFPImproving * improving >= beta) {
             // Pass-eval veto (SC_PASSEVAL): the static surplus must also cover tu * PassRfp / 16.
             // RFP is the ONE plug point F1's signed decomposition supports: it trusts that a high
             // eval means a cutoff, so it is exposed to OVER-optimism, and tension predicts exactly
@@ -851,7 +938,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             // Uses tu, the two-sided asymmetric measure, not tn (T computed lazily).
             if constexpr (SC_PASSEVAL)
                 if (pass_[PASS_RFP] > 0) need_tension();
-            if (eval - kRFPMargin * (depth - improving) - (SC_PASSEVAL ? tu * pass_[PASS_RFP] / 16 : 0) >= beta)
+            if (eval - kRFPMargin * depth + kRFPImproving * improving - (SC_PASSEVAL ? tu * pass_[PASS_RFP] / 16 : 0) >= beta)
                 return (eval + beta) / 2;
         }
 
@@ -880,18 +967,18 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 }
             }
             if (nmp_ok) {
-            const Depth R = 4 + depth / 4 + std::min(3, (eval - beta) / 200);
+            const Depth R = kNMPBase + depth / kNMPDepthDiv + std::min(3, (eval - beta) / kNMPEvalDiv);
 
             ss->current_move = Move(Move::NULL_MOVE);
             ss->moved_piece  = 12;
             ss->moved_to     = 0;
 
-            pool_.tt_.prefetch(board.zobristAfter(Move(Move::NULL_MOVE)));  // D3b: null child
-            nnue::acc_make_null();
+            pool_.tt_.prefetch(r50_key(board.zobristAfter(Move(Move::NULL_MOVE)), static_cast<int>(board.halfMoveClock())));  // D3b: null child
+            nnue::acc_make_null(*nn_);
             board.makeNullMove();
             const Value v = -negamax(board, ss + 1, depth - R, -beta, -beta + 1, !cut_node);
             board.unmakeNullMove();
-            nnue::acc_unmake_null();
+            nnue::acc_unmake_null(*nn_);
 
             if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
             // Never return unproven mate scores from a null search.
@@ -919,15 +1006,15 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 ss->moved_piece  = static_cast<int>(board.at(pm.from()));
                 ss->moved_to     = pm.to().index();
 
-                pool_.tt_.prefetch(board.zobristAfter(pm));
-                nnue::acc_make(board, pm);
+                pool_.tt_.prefetch(r50_key_after(board, pm));
+                nnue::acc_make(*nn_, board, pm);
                 board.makeMove(pm);
                 Value v = -qsearch(board, ss + 1, -probcut_beta, -probcut_beta + 1);
                 if (v >= probcut_beta && !pool_.stop_.load(std::memory_order_relaxed))
                     v = -negamax(board, ss + 1, depth - 4, -probcut_beta, -probcut_beta + 1,
                                  !cut_node);
                 board.unmakeMove(pm);
-                nnue::acc_unmake();
+                nnue::acc_unmake(*nn_);
 
                 if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
                 if (v >= probcut_beta) {
@@ -972,6 +1059,15 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
     Move tried_caps[32];
     int  n_quiets = 0, n_caps = 0;
 
+    // Per-move pruning bounds: they depend only on depth, improving and width_, which stay fixed
+    // across this node's move loop, so they are computed once. (2 - improving) is 1 or 2: the
+    // halving is the same integer division, without a runtime idiv per quiet move.
+    int lmp_limit = kLmpBase + kLmpMul * depth * depth / 16;
+    if (!improving) lmp_limit /= 2;
+    lmp_limit += lmp_limit * width_ / 256;
+    int fut_margin = kFutilityBase + kFutilityPerDepth * depth;
+    fut_margin += fut_margin * width_ / 256;
+
     Move m;
     while ((m = picker.next(skip_quiets)) != Move(Move::NO_MOVE)) {
         if (m == excluded) continue;
@@ -1008,15 +1104,11 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             if (quiet) {
                 // Late move pruning: past this move count, quiets are noise.
                 // Width admits proportionally more quiets before cutting off.
-                int lmp_limit = (3 + depth * depth) / (2 - improving);
-                lmp_limit += lmp_limit * width_ / 256;
                 if (move_count >= lmp_limit) skip_quiets = true;
 
                 // Futility: static eval so far below alpha that a quiet move
                 // has no realistic chance of raising it. Width demands a
                 // proportionally deeper deficit before giving up on quiets.
-                int fut_margin = kFutilityBase + kFutilityPerDepth * depth;
-                fut_margin += fut_margin * width_ / 256;
                 if (!in_check && depth <= kFutilityMaxDepth &&
                     ss->static_eval + fut_margin <= alpha && !gives_check())
                     skip_quiets = true;
@@ -1051,7 +1143,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             excluded == Move(Move::NO_MOVE) && probe.hit && !is_mate_score(tt_value) &&
             (static_cast<int>(tt_bound) & static_cast<int>(Bound::LOWER)) &&
             tt_depth >= depth - 3) {
-            const Value sing_beta  = tt_value - 2 * depth;
+            const Value sing_beta  = tt_value - kSingularBetaMul * depth / 16;
             const Depth sing_depth = (depth - 1) / 2;
 
             ss->excluded  = m;
@@ -1081,25 +1173,26 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
         const bool gives_check_now = gives_check();
         // D3: prefetch the child's TT cluster BEFORE the NNUE update so the accumulator
         // work hides the miss (issued after makeMove it led the probe by only a few ns).
-        // zobristAfter() is the library's exact post-move key for the makeMove<false>
-        // the search uses (same en-passant rule); a prefetch cannot change any result.
-        pool_.tt_.prefetch(board.zobristAfter(m));
-        nnue::acc_make(board, m);
+        // r50_key_after() is the child's key (inexact on en-passant / castling-rights moves:
+        // ZA); a prefetch cannot change any result.
+        pool_.tt_.prefetch(r50_key_after(board, m));
+        nnue::acc_make(*nn_, board, m);
         board.makeMove(m);
 
         // ---- PVS + late move reductions ----
         Value score = -VALUE_INFINITE;
 
         if (depth >= 2 && move_count > 1 + (root ? 1 : 0)) {
+            // In 1/1024 ply until the truncation to whole plies below.
             int r = kLmr[std::min<int>(depth, 63)][std::min(move_count, 63)];
-            r += !improving;
-            r += 2 * cut_node;
-            r -= pv_node;
-            r -= gives_check_now;
+            r += kLmrNotImproving * !improving;
+            r += kLmrCutNode * cut_node;
+            r -= kLmrPvNode * pv_node;
+            r -= kLmrGivesCheck * gives_check_now;
             if (!quiet)
-                r -= 1;  // reduce tactical moves less
+                r -= kLmrTactical;  // reduce tactical moves less
             else
-                r -= std::clamp(picker.last_score() / 8192, -2, 2);  // history-informed
+                r -= 1024 * std::clamp(picker.last_score() / kLmrHistDiv, -2, 2);  // history-informed
 
             if constexpr (SC_PASSEVAL) {
                 // Reduce MORE under tension, and only quiets. The measured signal (F1, phase
@@ -1115,7 +1208,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 // width scaling on purpose: a positive term is damped at an unstable root, where a
                 // negative one used to escape damping entirely by driving r <= 0.
                 const int div = pass_[PASS_LMR_DIV];
-                if (div > 0 && quiet && !gives_check_now) r += std::min(2, tn / div);
+                if (div > 0 && quiet && !gives_check_now) r += 1024 * std::min(2, tn / div);
             }
 
             if constexpr (SC_THRSIG > 0) {
@@ -1124,8 +1217,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 // this is a semantic condition -- "this move makes a threat" -- and it is the class of
                 // quiet move a reduction is most likely to mis-handle, because history scores where a
                 // move worked before, not what it threatens here.
-                if (quiet && !gives_check_now && nnue::acc_threats_made() >= SC_THRSIG_MIN)
-                    r -= SC_THRSIG;
+                if (quiet && !gives_check_now && nnue::acc_threats_made(*nn_) >= SC_THRSIG_MIN)
+                    r -= 1024 * SC_THRSIG;
             }
 
             if constexpr (SC_ACCSIG != 0 && SC_ACCSIG_LOW > 0) {
@@ -1135,8 +1228,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 // relief form below, because this one PRUNES harder and so shrinks the tree, where
                 // reducing less grows it -- the measured difference between starting ~3 Elo behind and
                 // starting ahead.
-                if (quiet && !gives_check_now && nnue::acc_delta_l1() < SC_ACCSIG_LOW)
-                    r += 1;
+                if (quiet && !gives_check_now && nnue::acc_delta_l1(*nn_) < SC_ACCSIG_LOW)
+                    r += 1024;
             }
 
             if constexpr (SC_ACCSIG != 0 && SC_ACCSIG_DIV > 0) {
@@ -1153,10 +1246,14 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
                 // wants. Captures and check-givers stay exempt for the same reason as in E2: they
                 // already get relief above.
                 if (quiet && !gives_check_now && depth >= SC_ACCSIG_MINDEPTH) {
-                    const int sig = nnue::acc_delta_l1();
-                    r -= std::min(SC_ACCSIG_MAX, sig / SC_ACCSIG_DIV);
+                    const int sig = nnue::acc_delta_l1(*nn_);
+                    r -= 1024 * std::min(SC_ACCSIG_MAX, sig / SC_ACCSIG_DIV);
                 }
             }
+
+            // Whole plies. Truncation toward zero differs from floor only for a negative sum,
+            // and any r <= 0 searches at new_depth (the clamp below), so it cannot matter.
+            r /= 1024;
 
             // Adaptive width: shrink positive reductions in proportion to the
             // current width (continuous widening; never scales extensions,
@@ -1178,7 +1275,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             score = -negamax(board, ss + 1, new_depth, -beta, -alpha, false);
 
         board.unmakeMove(m);
-        nnue::acc_unmake();
+        nnue::acc_unmake(*nn_);
 
         if (pool_.stop_.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
@@ -1298,7 +1395,7 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
             if (!in_check && !best_cap && ss->static_eval != VALUE_NONE &&
                 !is_mate_score(best) && (best > ss->static_eval) == have_best) {
                 int bonus = std::clamp((best - ss->static_eval) * depth *
-                                           (have_best ? 12 : 18) / 128,
+                                           (have_best ? kCorrUpdBest : kCorrUpdNoBest) / 1024,
                                        -HISTORY_MAX / 4, HISTORY_MAX / 4);
                 if constexpr (SC_PASSEVAL) {
                     // Weight the update by how LEARNABLE this node's residual is, not by how large
@@ -1340,7 +1437,8 @@ Value Worker::negamax(Board& board, Stack* ss, Depth depth, Value alpha, Value b
 void Worker::update_stats(const Board& board, Stack* ss, Move best_move, Depth depth,
                           const Move* quiets, int quiet_count, const Move* captures,
                           int capture_count) {
-    const int bonus = std::min(160 * depth - 90, 1700);
+    const int bonus = std::min(kHistBonusMul * depth - kHistBonusSub, kHistBonusMax);
+    const int malus = bonus * kHistMalusScale / 1024;
     const int stm   = static_cast<int>(board.sideToMove());
 
     // E6: the two continuation rows are fixed for this node; resolve them once instead
@@ -1378,14 +1476,14 @@ void Worker::update_stats(const Board& board, Stack* ss, Move best_move, Depth d
 
         bump_quiet(best_move, bonus);
         for (int i = 0; i < quiet_count; ++i)
-            if (quiets[i] != best_move) bump_quiet(quiets[i], -bonus);
+            if (quiets[i] != best_move) bump_quiet(quiets[i], -malus);
     } else if (board.isCapture(best_move)) {
         bump_capture(best_move, bonus);
     }
 
     // Captures that were tried before the cutoff move get a malus either way.
     for (int i = 0; i < capture_count; ++i)
-        if (captures[i] != best_move) bump_capture(captures[i], -bonus);
+        if (captures[i] != best_move) bump_capture(captures[i], -malus);
 }
 
 // ---- Iterative deepening ----------------------------------------------------------
@@ -1462,7 +1560,7 @@ void Worker::think() {
         // the rest (and the main worker) fill it in order.
         if (!main_worker && (id_ & 1) && (d & 1) == 0 && d < max_depth) continue;
 
-        nnue::acc_reset(board);  // fresh incremental base accumulator at the root
+        nnue::acc_reset(*nn_, board);  // fresh incremental base accumulator at the root
 
         width_    = pool_.width_.load(std::memory_order_relaxed);  // stable per iteration
         if constexpr (SC_PASSEVAL)   // one consistent tunable set per iteration (see kPassParams)
@@ -1593,7 +1691,7 @@ void Worker::think() {
         prev_best = best_move_;
 
         // ---- Search width for the next iteration ----
-        if constexpr (kBreadthMax > 0) {
+        if (kBreadthMax > 0) {
             int width = 0;
             if (d >= kBreadthMinDepth && !is_mate_score(score) &&
                 root_second_ > -VALUE_INFINITE) {
@@ -1756,9 +1854,11 @@ void Worker::report_multipv(Depth depth) {
     const std::uint64_t nps   = nodes * 1000ULL / static_cast<std::uint64_t>(ms);
     const bool          c960  = pool_.root_.chess960();
     const int           rn    = g_root_noise.load(std::memory_order_relaxed);
-    // Read once per report so every line of it agrees; the chances use the root's material.
+    // Read once per report so every line of it agrees; the chances and the normalized cp use the root's
+    // material.
     const bool          show_wdl = g_show_wdl.load(std::memory_order_relaxed);
-    const int           root_mat = show_wdl ? wdl_material(pool_.root_) : 0;
+    const bool          cp_norm  = kCpNorm && g_cp_norm.load(std::memory_order_relaxed);
+    const int           root_mat = (show_wdl || cp_norm) ? wdl_material(pool_.root_) : 0;
 
     for (int i = 0; i < multipv_; ++i) {
         const RootMove& rm       = root_moves_[static_cast<std::size_t>(i)];
@@ -1782,7 +1882,7 @@ void Worker::report_multipv(Depth depth) {
             // Remove this line's root-noise bonus so the reported score (the self-play
             // training label) is the move's true eval, not the noisy one.
             const Value clean = (rn > 0) ? v - root_noise_offset(rm.move, rn) : v;
-            ss << "cp " << clean;
+            ss << "cp " << (cp_norm ? normalized_cp(clean, root_mat) : clean);
             shown = clean;
         }
 

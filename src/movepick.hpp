@@ -41,8 +41,8 @@ struct OrderingContext {
 
 class MovePicker {
    public:
-    // `captures_only` selects quiescence generation (ignored when the side to
-    // move is in check — evasions need the full move list).
+    // `captures_only` selects quiescence generation; the caller passes false when the side
+    // to move is in check (evasions need the full move list).
     MovePicker(const Board& board, const History& hist, const OrderingContext& ctx,
                bool captures_only);
 
@@ -64,9 +64,10 @@ class MovePicker {
 
     const Board& board_;
     Movelist     moves_;
-    int          scores_[MAX_MOVES];
+    int          scores_[MAX_MOVES + 8];   // + 8: the AVX2 scan's padding (M3x)
     std::int8_t  see_[MAX_MOVES];   // per-move SEE verdict at threshold 0 (+1 / -1 / 0 unknown), see last_see()
     int          cur_        = 0;
+    std::int8_t  skip_mode_  = 0;   // M4 (NPS 3.6): 0 = undecided, 1 = shortcut, 2 = exact scan
     int          last_score_ = 0;
     int          last_see_   = 0;
 };

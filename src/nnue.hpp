@@ -15,6 +15,7 @@
 // -----------------------------------------------------------------------------
 
 #include <cstddef>
+#include <memory>
 #include <string>
 
 #include "types.hpp"
@@ -46,7 +47,31 @@ bool load_memory(const void* data, std::size_t size);
 [[nodiscard]] Value evaluate_pass(const Board& board);
 
 // -----------------------------------------------------------------------------
-// Incremental accumulator (thread-local). The search maintains it around
+// Per-thread incremental state. A search worker owns one Context and passes it to every
+// call below (no thread-local lookups on the hot path). Each function also has a
+// context-free form that uses the calling thread's own context (UCI debug commands).
+// -----------------------------------------------------------------------------
+struct Context;
+[[nodiscard]] Context* context_new();
+void context_free(Context* c);
+struct ContextDeleter {
+    void operator()(Context* c) const noexcept { context_free(c); }
+};
+using ContextPtr = std::unique_ptr<Context, ContextDeleter>;
+
+[[nodiscard]] Value evaluate(Context& c, const Board& board);
+[[nodiscard]] Value evaluate_pass(Context& c, const Board& board);
+void acc_reset(Context& c, const Board& board);
+void acc_make(Context& c, const Board& before, Move m);
+void acc_unmake(Context& c);
+void acc_clear(Context& c);
+void acc_make_null(Context& c);
+void acc_unmake_null(Context& c);
+[[nodiscard]] int acc_delta_l1(const Context& c) noexcept;
+[[nodiscard]] int acc_threats_made(const Context& c) noexcept;
+
+// -----------------------------------------------------------------------------
+// Incremental accumulator. The search maintains it around
 // make/unmake so evaluate() reads a persisted BASE accumulator instead of
 // rebuilding it from scratch every call. If these are never called, evaluate()
 // transparently falls back to full recompute (correctness preserved), so the
