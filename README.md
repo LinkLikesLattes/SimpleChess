@@ -4,7 +4,7 @@
 
 <h1 align="center">SimpleChess</h1>
 
-<p align="center">A UCI chess engine in C++20 with a custom, self-play-trained neural-network evaluation.</p>
+<p align="center">From an HCE that relied on simple chess principles came the NNUE that rose above them.</p>
 
 
 SimpleChess pairs a modern, heavily-tuned alpha-beta search with a from-scratch
