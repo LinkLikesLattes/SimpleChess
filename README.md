@@ -15,11 +15,11 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 ## Strength
 
-| Version | CCRL Blitz | CCRL 40/15 |
-|---|---|---|
-| 3.6.0 1CPU | Not yet tested | Not yet tested |
-| 3.5.0 1CPU | **3562** (±16, #84, 959 games) | **3485** (±18, #88, 556 games) |
-| 3.4 or earlier | Never tested | Never tested |
+| Version | CCRL Blitz 1CPU | CCRL Blitz 8CPU | CCRL 40/15 1CPU | CCRL 40/15 4CPU |
+|---|---|---|---|---|
+| 3.6.0 | Not yet tested | Not yet tested | Not yet tested | Not yet tested |
+| 3.5.0 | **3561** (±16, #84, 959 games) | Not yet tested | **3485** (±18, #88, 556 games) | Not yet tested |
+| 3.4 or earlier | Never tested | Never tested | Never tested | Never tested |
 
 <sub>CCRL ratings as of 2026-10-30.</sub>
 
