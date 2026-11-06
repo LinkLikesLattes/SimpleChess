@@ -389,7 +389,7 @@ void UCI::handle_setoption(std::istringstream& is) {
     } else if (iequals(name, "Syzygy50MoveRule")) {
         syzygy::set_fifty_rule(iequals(value, "true") || value == "1");
     } else if (name.size() > 4 && iequals(name.substr(0, 4), "Pass")) {
-        // Pass-eval tunables (SC_PASSEVAL builds; see kPassParams in search.cpp).
+        // Pass-eval tunables (see kPassParams in search.cpp).
         if (const auto v = spin(std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
             v && set_pass_param(name, *v))
             sync_cout << "info string " << name << " = " << *v << sync_endl;
@@ -713,24 +713,6 @@ void UCI::loop() {
             // from the side to move's perspective.
             sync_cout << "static eval (stm pov): " << nnue::evaluate(board_) << " cp"
                       << sync_endl;
-        } else if (command == "accsig") {
-            // Debug: for every legal move of the current position, print the L1 norm of the
-            // accumulator change it makes (item #8's signal) plus whether it is a capture, so the
-            // divisor can be set from the measured distribution of QUIET moves rather than guessed.
-            Movelist ml;
-            chess::movegen::legalmoves(ml, board_);
-            nnue::acc_reset(board_);
-            for (const auto& m : ml) {
-                nnue::acc_make(board_, m);
-                const int sig = nnue::acc_delta_l1();
-                const int thr = nnue::acc_threats_made();
-                nnue::acc_unmake();
-                sync_cout << "accsig " << chess::uci::moveToUci(m, board_.chess960())
-                          << ' ' << sig << ' ' << (board_.isCapture(m) ? "cap" : "quiet")
-                          << ' ' << thr << sync_endl;
-            }
-            nnue::acc_clear();  // later eval/passeval must not read this position's accumulator
-            sync_cout << "accsigend" << sync_endl;
         } else if (command == "passeval") {
             // Debug: E = static eval, P = our eval if we passed, T = E - P (tension); see
             // nnue::evaluate_pass. Undefined in check (the passed position would be illegal).

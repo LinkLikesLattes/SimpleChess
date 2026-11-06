@@ -22,1108 +22,11 @@
 //   (SCN4 float -> SCN5 int8 playing net via the net quantiser in the dev tooling.)
 // -----------------------------------------------------------------------------
 
-#include "nnue.hpp"
-
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <istream>
-#include <streambuf>
-#include <memory>
-#include <new>
-#include <string>
-#include <vector>
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-#if defined(__AVX2__)
-#include <immintrin.h>   // x86 AVX2 kernels (Haswell+; the CCRL ship target)
-#endif
-
-#if defined(_WIN32)
-// D2: back the ~35 MB feature-transformer weights (l0w_i8) with 2 MB large pages to cut
-// TLB misses on the scattered 512 B feature-row gathers. Only allocations >= 2 MB take
-// this path, so the small L1/L2/L3 weight vectors keep operator new. A tiny registry
-// records which pointers are large-page-backed so deallocate() frees them correctly.
-// The stored weights are byte-identical either way -> bit-identical.
-#include <mutex>
-#include <unordered_set>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-namespace {
-constexpr std::size_t kLargePageThresh = 2u * 1024u * 1024u;
-std::mutex             g_lp_mu;
-std::unordered_set<void*>& g_lp_set() { static std::unordered_set<void*> s; return s; }
-bool sc_enable_lock_pages_nnue() {
-    HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
-        return false;
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount           = 1;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    bool ok = LookupPrivilegeValue(nullptr, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid) &&
-              AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) &&
-              GetLastError() == ERROR_SUCCESS;
-    CloseHandle(tok);
-    return ok;
-}
-void* sc_nnue_large_alloc(std::size_t bytes) {
-    static const bool priv = sc_enable_lock_pages_nnue();
-    if (!priv) return nullptr;
-    const std::size_t gran = GetLargePageMinimum();
-    if (gran == 0) return nullptr;
-    const std::size_t rounded = ((bytes + gran - 1) / gran) * gran;
-    void* p = VirtualAlloc(nullptr, rounded, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-                           PAGE_READWRITE);
-    if (p) { std::lock_guard<std::mutex> lk(g_lp_mu); g_lp_set().insert(p); }
-    return p;
-}
-bool sc_nnue_large_free(void* p) {
-    std::lock_guard<std::mutex> lk(g_lp_mu);
-    auto& s = g_lp_set();
-    auto it = s.find(p);
-    if (it == s.end()) return false;
-    s.erase(it);
-    VirtualFree(p, 0, MEM_RELEASE);
-    return true;
-}
-}  // namespace
-#endif
+#include "nnue_internal.hpp"
 
 namespace engine::nnue {
 
 namespace {
-
-// ---- Threat feature-set constants ------------------------------------------
-constexpr int THREAT_DIMS = 59808;   // FullThreats feature count
-constexpr int PP_PAWN_IDS = 2 * 48;  // colours * 48 pawn squares
-constexpr int PP_DIMS = PP_PAWN_IDS * (PP_PAWN_IDS - 1) / 2;  // 4560
-constexpr int PP_INDEX_BASE = THREAT_DIMS;
-
-// Piece code used by the threat index math: color bit = 8, type = code & 7 in 1..6.
-constexpr int SF_W_PAWN = 1;
-constexpr int SF_B_PAWN = 9;
-
-constexpr std::array<int, 16> NUM_VALID_TARGETS = {0, 4, 10, 8, 8, 10, 0, 0,
-                                                   0, 4, 10, 8, 8, 10, 0, 0};
-// map[attackerType-1][attackedType-1], types PAWN..KING = 1..6.
-constexpr std::array<std::array<int, 6>, 6> MAP = {{
-    {{-1, 0, -1, 1, -1, -1}},
-    {{0, 1, 2, 3, 4, -1}},
-    {{0, 1, 2, 3, -1, -1}},
-    {{0, 1, 2, 3, -1, -1}},
-    {{0, 1, 2, 3, 4, -1}},
-    {{-1, -1, -1, -1, -1, -1}},
-}};
-
-// ---- king-bucket layout (MUST match train_threats.rs BUCKET_LAYOUT) ---------
-constexpr std::array<int, 32> BUCKET_LAYOUT = {
-    0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
-    8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
-};
-constexpr std::array<int, 8> MIRROR = {0, 1, 2, 3, 3, 2, 1, 0};
-inline int king_bucket(int sq) { return BUCKET_LAYOUT[(sq / 8) * 4 + MIRROR[sq % 8]]; }
-constexpr int kKingBuckets = *std::max_element(BUCKET_LAYOUT.begin(), BUCKET_LAYOUT.end()) + 1;
-
-inline int file_of(int sq) { return sq & 7; }
-inline int rank_of(int sq) { return sq >> 3; }
-inline int orient_tbl(int ksq) { return (file_of(ksq) > 3) ? 7 : 0; }
-
-// ---- geometric attack helpers (raw u64, mirror threat_inputs.rs) ------------
-std::uint64_t ray_attacks(int sq, std::uint64_t occ, const int (*deltas)[2], int nd) {
-    std::uint64_t bb = 0;
-    const int f0 = file_of(sq), r0 = rank_of(sq);
-    for (int d = 0; d < nd; ++d) {
-        int f = f0 + deltas[d][0], r = r0 + deltas[d][1];
-        while (f >= 0 && f < 8 && r >= 0 && r < 8) {
-            const int s = r * 8 + f;
-            bb |= 1ull << s;
-            if (occ & (1ull << s)) break;
-            f += deltas[d][0];
-            r += deltas[d][1];
-        }
-    }
-    return bb;
-}
-constexpr int ROOK_DIRS[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-constexpr int BISHOP_DIRS[4][2] = {{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
-
-// Knight / king / pawn attack sets. The loop forms are constexpr and build lookup tables at
-// compile time; the hot paths read the tables (NPS 3.6 item T1). Same sets by construction.
-constexpr std::uint64_t knight_attacks_loop(int sq) {
-    const int f0 = sq & 7, r0 = sq >> 3;
-    constexpr int d[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
-    std::uint64_t bb = 0;
-    for (const auto& k : d) {
-        const int f = f0 + k[0], r = r0 + k[1];
-        if (f >= 0 && f < 8 && r >= 0 && r < 8) bb |= 1ull << (r * 8 + f);
-    }
-    return bb;
-}
-constexpr std::uint64_t king_attacks_loop(int sq) {
-    const int f0 = sq & 7, r0 = sq >> 3;
-    std::uint64_t bb = 0;
-    for (int df = -1; df <= 1; ++df)
-        for (int dr = -1; dr <= 1; ++dr) {
-            if (!df && !dr) continue;
-            const int f = f0 + df, r = r0 + dr;
-            if (f >= 0 && f < 8 && r >= 0 && r < 8) bb |= 1ull << (r * 8 + f);
-        }
-    return bb;
-}
-constexpr std::uint64_t pawn_attacks_loop(int color, int sq) {  // 0 = white (north), 1 = black
-    const int f0 = sq & 7, r0 = sq >> 3, dr = (color == 0) ? 1 : -1;
-    std::uint64_t bb = 0;
-    for (int df = -1; df <= 1; df += 2) {
-        const int f = f0 + df, r = r0 + dr;
-        if (f >= 0 && f < 8 && r >= 0 && r < 8) bb |= 1ull << (r * 8 + f);
-    }
-    return bb;
-}
-// NPS 3.6 item S1: at load, reorder the hidden neurons so the ones that are usually zero after the
-// pairwise activation sit together, then run L1 as a sparse product over the nonzero 4-byte input
-// chunks (int8 dot-products of 4 inputs). Any neuron order gives the same integer L1 sums -> the
-// evaluation is bit-identical; the order only decides how many all-zero chunks can be skipped.
-#ifndef SC_NPS_S1
-#define SC_NPS_S1 1
-#endif
-// NPS 3.6 item P2: pairwise division by 127 without 32-bit multiplies. For x = a*b with a, b in
-// [0,127] (x <= 16129), floor(x/127) == (x + 1 + ((x + 1) >> 7)) >> 7 exactly (checked for every
-// x in [0, 16129]), so: vmla (1 + a*b, u16), vsra (+ >>7), vshrn (>>7, narrowed to u8). Same h8.
-#ifndef SC_NPS_P2
-#define SC_NPS_P2 1
-#endif
-// NPS 3.6 item K1: king-bucket crossings from cached piece-square sums. When the moving king
-// changes bucket (same mirror side), its own perspective needs every piece's base column under the
-// new bucket instead of the old one. Each (perspective, mirror, bucket) keeps the int16 sum of the
-// base columns of the pieces it last saw plus those pieces' bitboards; bringing a cache up to date
-// costs only the pieces that changed since. Then acc -= old bucket's sum, += new bucket's sum.
-// int16 sums wrap identically however they are grouped -> bit-identical.
-#ifndef SC_NPS_K1
-#define SC_NPS_K1 1
-#endif
-#ifndef SC_NPS_K1_MIN   // men on the board from which K1 is used: 16 on both machines (i7-9700 and, re-tuned
-#define SC_NPS_K1_MIN 16  // on net 10-15, the M1 Max: +0.43% over 20, 12 below 16)
-#endif
-#ifndef SC_NPS_A2
-#define SC_NPS_A2 1
-#endif
-// x86 FX: the float labeler path (SCN4 net: int32 fixed-point accumulator, float body) on AVX2 --
-// it ran the scalar fallbacks (the int8 play path had all the x86 work). Same integers in the
-// accumulator, the same per-element float ops, and the same per-output fma chain in L1.
-#ifndef SC_FX_AVX2
-#if defined(__AVX2__)
-#define SC_FX_AVX2 1
-#else
-#define SC_FX_AVX2 0
-#endif
-#endif
-// Mac FX (float labeler on NEON), both layout only -> bit-identical:
-//  FXB  bucket-major float L1 copy (l1w_bm, as x86 47303d3) for the NEON input-major L1: each bucket's
-//       64 KB contiguous instead of 128-byte rows at a 1 KB stride.
-//  FXS  one physical copy of the 147 MB fixed-point FT (l0w_fx) for all engine processes: the first
-//       process to load a float net writes it to a cache file in $TMPDIR (under an flock, renamed into
-//       place) and every process maps that file read-only and shared. Any failure keeps a private copy.
-//       Windows (default 1): a named pagefile-backed section instead (see fx_share_map). i7-9700,
-//       8-worker self-play at depth 9: +26% (private copies 505/498 pos/s, shared 634/627).
-// Mac, measured with tools/speed/fx8_bench.py (8 workers, depth 9, 240 superbook-p1 games per run, M1 Max):
-// FXB +2.37% / +4.53% (two sessions, 4 and 6 rounds), FXS on top of FXB +2.72% / +1.63%, both +5.16% / +6.24%.
-#ifndef SC_FX_L1BM_NEON
-#if defined(__ARM_NEON)
-#define SC_FX_L1BM_NEON 1
-#else
-#define SC_FX_L1BM_NEON 0
-#endif
-#endif
-// x86 FXZ: lazy float accumulator. acc_make records a ply's add/sub column lists instead of applying
-// them, and the first read of that ply (eval, a child that must apply its own delta, a null move)
-// applies them from the newest computed ancestor, one ply at a time -- the same src->dst int32 pass,
-// so the accumulator holds the same integers. A ply popped unread costs no column traffic (~18% of
-// float updates are never read; SC_LZSTAT on 12 depth-9 games).
-#ifndef SC_FX_LAZY
-#if defined(__x86_64__) || defined(_M_X64)
-#define SC_FX_LAZY 1
-#else
-#define SC_FX_LAZY 0
-#endif
-#endif
-constexpr int kFxPendCap = 96;
-// x86 FXP: the float eval's int32->float fill, pairwise product and the L1's nonzero masks in one
-// pass straight from the accumulator (the same per-element ops; no 4 KB float copy written and read
-// back), and an eval frame under one page (no Windows stack probe per eval).
-#ifndef SC_FX_FUSE
-#define SC_FX_FUSE 1
-#endif
-#if defined(__AVX2__) && SC_FX_AVX2 && SC_FX_FUSE
-#define SC_FXP 1
-#else
-#define SC_FXP 0
-#endif   // FXZ: columns per perspective a deferred ply can hold (more -> applied at once)
-#ifndef SC_FX_SHARE   // the Windows section and the macOS file mapping; not measured elsewhere
-#if defined(_WIN32) || defined(__APPLE__)
-#define SC_FX_SHARE 1
-#else
-#define SC_FX_SHARE 0
-#endif
-#endif
-#ifndef SC_NPS_SMALLCOLS   // fused_apply_src (AVX2): column-outer up to this many columns
-#define SC_NPS_SMALLCOLS 2
-#endif
-#ifndef SC_NPS_L3S   // L3 over the nonzero screlu outputs only: always on AVX2; NEON behind this switch
-#define SC_NPS_L3S 0
-#endif
-#ifndef SC_NPS_T1
-#define SC_NPS_T1 1
-#endif
-constexpr auto kKnightAtt = [] { std::array<std::uint64_t, 64> t{}; for (int s = 0; s < 64; ++s) t[s] = knight_attacks_loop(s); return t; }();
-constexpr auto kKingAtt   = [] { std::array<std::uint64_t, 64> t{}; for (int s = 0; s < 64; ++s) t[s] = king_attacks_loop(s); return t; }();
-constexpr auto kPawnAtt   = [] {
-    std::array<std::array<std::uint64_t, 64>, 2> t{};
-    for (int c = 0; c < 2; ++c) for (int s = 0; s < 64; ++s) t[c][s] = pawn_attacks_loop(c, s);
-    return t;
-}();
-inline std::uint64_t knight_attacks(int sq) { return SC_NPS_T1 ? kKnightAtt[sq] : knight_attacks_loop(sq); }
-inline std::uint64_t king_attacks(int sq) { return SC_NPS_T1 ? kKingAtt[sq] : king_attacks_loop(sq); }
-inline std::uint64_t pawn_attacks(int color, int sq) { return SC_NPS_T1 ? kPawnAtt[color][sq] : pawn_attacks_loop(color, sq); }
-std::uint64_t pseudo_attacks_type(int pt, int sq) {  // piece type 2..6 = N,B,R,Q,K
-    switch (pt) {
-        case 2: return knight_attacks(sq);
-        case 3: return ray_attacks(sq, 0, BISHOP_DIRS, 4);
-        case 4: return ray_attacks(sq, 0, ROOK_DIRS, 4);
-        case 5: return ray_attacks(sq, 0, BISHOP_DIRS, 4) | ray_attacks(sq, 0, ROOK_DIRS, 4);
-        case 6: return king_attacks(sq);
-        default: return 0;
-    }
-}
-std::uint64_t attacks_bb(int pt, int sq, std::uint64_t occ) {
-    // Hot path: magic-bitboard slider attacks (same sets as the scalar rays,
-    // parity preserved). Knight/king are table lookups.
-    switch (pt) {
-        case 2: return knight_attacks(sq);
-        case 3: return chess::attacks::bishop(chess::Square(sq), chess::Bitboard(occ)).getBits();
-        case 4: return chess::attacks::rook(chess::Square(sq), chess::Bitboard(occ)).getBits();
-        case 5: return chess::attacks::queen(chess::Square(sq), chess::Bitboard(occ)).getBits();
-        case 6: return king_attacks(sq);
-        default: return 0;
-    }
-}
-std::uint64_t pseudo_for_index(int sf_piece, int sq) {
-    const int pt = sf_piece & 7;
-    if (pt == SF_W_PAWN) return pawn_attacks(sf_piece < 8 ? 0 : 1, sq);
-    return pseudo_attacks_type(pt, sq);
-}
-inline int popcount64(std::uint64_t x) { return __builtin_popcountll(x); }
-
-// ---- precomputed threat-index lookup tables (built once at load) ------------
-struct Tables {
-    std::array<std::array<std::uint32_t, 64>, 16> offsets{};
-    std::array<std::array<std::array<std::uint32_t, 2>, 16>, 16> lut1{};
-    std::array<std::array<std::array<std::uint8_t, 64>, 64>, 16> lut2{};
-    // TI: per [piece][from] the attack set lut2 counts in, next to that square's offset (16 KB
-    // in all, against lut2's 64 KB): lut2[p][f][t] == popcount(att & ((1 << t) - 1)).
-    struct AttOff { std::uint64_t att; std::uint32_t off; std::uint32_t pad; };
-    std::array<std::array<AttOff, 64>, 16> ao{};
-    std::array<std::uint64_t, 64> pawn_pair{};
-    bool built = false;
-};
-Tables g_tab;
-
-void build_tables() {
-    if (g_tab.built) return;
-    Tables& t = g_tab;
-    const int all_pieces[12] = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14};
-
-    std::array<std::uint32_t, 16> piece_off{};
-    std::array<std::uint32_t, 16> cum_off{};
-    std::uint32_t cumulative_offset = 0;
-    for (int piece : all_pieces) {
-        const int pt = piece & 7;
-        std::uint32_t cpo = 0;
-        for (int from = 0; from < 64; ++from) {
-            t.offsets[piece][from] = cpo;
-            if (pt != SF_W_PAWN)
-                cpo += popcount64(pseudo_attacks_type(pt, from));
-            else if (from >= 8 && from <= 55)
-                cpo += popcount64(pseudo_for_index(piece, from));
-        }
-        piece_off[piece] = cpo;
-        cum_off[piece] = cumulative_offset;
-        cumulative_offset += static_cast<std::uint32_t>(NUM_VALID_TARGETS[piece]) * cpo;
-    }
-
-    for (int attacker : all_pieces)
-        for (int attacked : all_pieces) {
-            const bool enemy = (attacker ^ attacked) == 8;
-            const int at = attacker & 7, dt = attacked & 7;
-            const int map_val = MAP[at - 1][dt - 1];
-            const bool semi_excluded = at == dt && (enemy || at != SF_W_PAWN);
-            const int color_attacked = (attacked >> 3) & 1;
-            const long feature = static_cast<long>(cum_off[attacker])
-                + (static_cast<long>(color_attacked) * (NUM_VALID_TARGETS[attacker] / 2) + map_val)
-                    * static_cast<long>(piece_off[attacker]);
-            const bool excluded = map_val < 0;
-            t.lut1[attacker][attacked][0] = excluded ? THREAT_DIMS : static_cast<std::uint32_t>(feature);
-            t.lut1[attacker][attacked][1] =
-                (excluded || semi_excluded) ? THREAT_DIMS : static_cast<std::uint32_t>(feature);
-        }
-
-    for (int piece : all_pieces)
-        for (int from = 0; from < 64; ++from) {
-            const std::uint64_t attacks = pseudo_for_index(piece, from);
-            t.ao[piece][from] = {attacks, t.offsets[piece][from], 0};
-            for (int to = 0; to < 64; ++to) {
-                const std::uint64_t mask = (to == 0) ? 0 : ((1ull << to) - 1);
-                t.lut2[piece][from][to] = static_cast<std::uint8_t>(popcount64(mask & attacks));
-            }
-        }
-
-    for (int s = 0; s < 64; ++s) {
-        const int f = file_of(s);
-        std::uint64_t files = 0;
-        for (int ff = f - 1; ff <= f + 1; ++ff)
-            if (ff >= 0 && ff < 8)
-                for (int r = 0; r < 8; ++r) files |= 1ull << (r * 8 + ff);
-        std::uint64_t rank27 = 0;
-        for (int r = 1; r < 7; ++r) rank27 |= 0xFFull << (r * 8);
-        t.pawn_pair[s] = files & rank27 & ~(1ull << s);
-    }
-
-    t.built = true;
-}
-
-// make_index on already-oriented squares / already-color-swapped pieces
-// (caller folds perspective). Returns THREAT_DIMS for excluded features.
-// x86 TI: the lut2 term computed (bzhi + popcnt on BMI2) from the 16 KB attack/offset table
-// instead of read from the 64 KB lut2, which does not fit the 32 KB L1d. Same integer.
-#ifndef SC_NPS_TI
-#if defined(__x86_64__) || defined(_M_X64)
-#define SC_NPS_TI 1
-#else
-#define SC_NPS_TI 0
-#endif
-#endif
-inline std::uint32_t make_threat_index(int attacker, int from, int to, int attacked) {
-    if constexpr (SC_NPS_TI) {
-        const Tables::AttOff& e = g_tab.ao[attacker][from];
-        return g_tab.lut1[attacker][attacked][from < to ? 1 : 0] + e.off
-             + static_cast<std::uint32_t>(__builtin_popcountll(e.att & ((1ull << to) - 1)));
-    }
-    return g_tab.lut1[attacker][attacked][from < to ? 1 : 0]
-         + g_tab.offsets[attacker][from]
-         + g_tab.lut2[attacker][from][to];
-}
-
-// ---- net --------------------------------------------------------------------
-// Quantisation scales (must match the net quantiser and the trainer's
-// save scheme): feature transformer x QA (int8 weights), L1 x QB (int8). The
-// int16 accumulator holds sums of int8 weights (activation scale 127).
-constexpr int QA = 127;
-constexpr int QB = 64;
-
-// Stack-buffer caps for the quant path (no per-eval heap allocation).
-constexpr int MAX_HL = 512;    // tight accumulator slots (2 KB, not 4 KB) for a 32 KB L1d; x86 campaign A10.
-                               // load() rejects nets with hl > MAX_HL, so this is a hard cap, not a hint.
-constexpr int MAX_L2 = 64;
-// Fixed-point scale for the float labeler's incremental accumulator. Integer add is
-// associative, so incremental == from-scratch bit-exactly; S is large enough that the
-// float eval it feeds is byte-identical to the from-scratch float path, and small
-// enough that the int32 accumulator never overflows (<=~250 active feats * 2^22 < 2^31).
-constexpr int    FX_SHIFT = 22;
-constexpr double FX_S     = double(1u << FX_SHIFT);
-
-// 64-byte-aligned storage for the hot weight tensors (x86 campaign G3): std::vector only
-// guarantees 16 B, so a 512 B FT row could straddle 9 cache lines instead of 8 and every
-// AVX2 row load is unaligned. Same bytes, same indexing -- only the address changes.
-template <class T> struct Align64Alloc {
-    using value_type = T;
-    Align64Alloc() = default;
-    template <class U> Align64Alloc(const Align64Alloc<U>&) noexcept {}
-    T* allocate(std::size_t n) {
-#if defined(_WIN32)
-        if (n * sizeof(T) >= kLargePageThresh) {
-            if (void* p = sc_nnue_large_alloc(n * sizeof(T))) return static_cast<T*>(p);
-        }
-#endif
-        return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64}));
-    }
-    void deallocate(T* p, std::size_t) noexcept {
-#if defined(_WIN32)
-        if (sc_nnue_large_free(p)) return;
-#endif
-        ::operator delete(p, std::align_val_t{64});
-    }
-    template <class U> bool operator==(const Align64Alloc<U>&) const noexcept { return true; }
-    template <class U> bool operator!=(const Align64Alloc<U>&) const noexcept { return false; }
-};
-#if defined(__ARM_NEON)
-template <class T> using WVec = std::vector<T>;                    // pre-G3: default (16-B) alignment
-#else
-template <class T> using WVec = std::vector<T, Align64Alloc<T>>;   // x86 campaign G3: +1.06% (all phases)
-#endif
-
-struct Net {
-    bool loaded = false;
-    bool quant = false;  // false = SCN4 float, true = SCN5 quantised (int8 FT)
-    int hl = 0, input_buckets = 0, l2 = 0, out_buckets = 0;
-    // Output bucket per piece count, set at load: its two divisions (the divisor comes from the
-    // header, so they are runtime idivs) once per count instead of on every eval.
-    std::array<std::uint8_t, 65> obucket{};
-    std::size_t base_dims = 0, total_inputs = 0;
-    std::vector<float> l0w, l0b, l1w, l1b, l2b, l3w, l3b;
-    WVec<float> l2w;               // 64-B aligned (G3): finish_body reads 32-float rows
-    WVec<float> l2w_bm;            // G2: bucket-major [(b*L2 + i)*32 + o] -- 4 KB contiguous per bucket
-    WVec<float> l1w_bm;            // FXB (float net, L2 = 32): bucket-major [(b*HL + i)*32 + o], 64 KB per bucket
-    // quant path: int8 feature transformer + int8 L1 (body stays float);
-    // int16 accumulator + int16 FT bias.
-    WVec<std::int8_t> l0w_i8;      // 64-B aligned (G3): 512 B feature rows
-    std::vector<std::int16_t> l0b_i;
-    // float labeler path: fixed-point FT weights/bias (lround(w*FX_S)) for the
-    // incremental int32 accumulator. Built at load for float (SCN4) nets.
-    WVec<std::int32_t> l0w_fx;     // 147 MB int32 FT columns: 64-B aligned, large pages on Windows (as l0w_i8)
-    std::shared_ptr<const std::int32_t> l0w_fx_shared;   // FXS: the same columns in a shared read-only mapping
-    const std::int32_t* l0w_fx_p = nullptr;              // what the labeler reads: the mapping or l0w_fx
-    std::vector<std::int32_t> l0b_fx;
-    std::vector<std::int8_t> l1w_i;
-    // L1 weights transposed to [bucket*L2 + o][HL] (HL contiguous) for the sdot
-    // dot-product path; built from l1w_i on load.
-    WVec<std::int8_t> l1w_dot;     // 64-B aligned (G3): 512 B rows per output
-    std::vector<float> l3w_t;      // A6: [b*32 + i] = l3w[i*OB + b] -- contiguous per output bucket
-    // int8 body: L2 weights as [bucket*32 + o][L2] (input contiguous) and L3 as
-    // [bucket*32 + i]; per-layer global scale. Built from l2w/l3w on load (quant net).
-    std::vector<std::int8_t> l2w_dot, l3w_dot;
-    float l2_scale = 0.0f, l3_scale = 0.0f;
-    // S1: L1 weights by input chunk, [bucket][hl/4 chunks][L2 outputs][4 inputs], for the sparse
-    // L1 (one 128-byte block per nonzero chunk at L2 = 32). Built after the neuron permutation.
-    WVec<std::int8_t> l1w_sp;
-};
-Net g_net;
-
-// FXS: the fixed-point FT columns of a float net, from (or into) a cache file shared by every engine
-// process: $TMPDIR/simplechess-fx-<key>.i32, key = FNV-1a over the dimensions, the fixed-point shift and
-// the float weights' bits. Under an exclusive flock the first process converts the weights exactly as
-// the private path does, writes them to a temporary file and renames it into place; every process then
-// maps the file read-only and shared, so the page cache holds one copy for all of them. Returns null on
-// any failure (no TMPDIR, disk full, a short file): the caller builds its private copy instead.
-//
-// Windows: the first process publishes the columns in a named pagefile-backed section
-// (SEC_LARGE_PAGES when the lock-pages privilege allows), named by a hash of the int32 columns
-// themselves; the others open it under a named mutex and map it read-only only after a full memcmp
-// against their own conversion (a section from another build or layout is never used). Nothing
-// outlives the processes. SCNNUE_NOFXSHARE=1 disables it at run time on both (A/B on one binary);
-// SCNNUE_FXSHARE_LOG=1 prints which path was taken to stderr.
-std::shared_ptr<const std::int32_t> fx_share_map([[maybe_unused]] const std::vector<float>& l0w,
-                                                 [[maybe_unused]] std::size_t ti, [[maybe_unused]] std::size_t hl) {
-#if defined(_WIN32)
-    const std::size_t nw = ti * hl, bytes = nw * sizeof(std::int32_t);
-    if (l0w.size() != nw || nw == 0 || std::getenv("SCNNUE_NOFXSHARE")) return nullptr;
-    std::vector<std::int32_t> fx(nw);
-    for (std::size_t i = 0; i < nw; ++i)
-        fx[i] = static_cast<std::int32_t>(std::lround(double(l0w[i]) * FX_S));
-    std::uint64_t h = 1469598103934665603ull ^ bytes;
-    const unsigned char* b = reinterpret_cast<const unsigned char*>(fx.data());
-    for (std::size_t i = 0; i + 8 <= bytes; i += 8) {
-        std::uint64_t x;
-        std::memcpy(&x, b + i, 8);
-        h = (h ^ x) * 0x100000001b3ull;
-        h ^= h >> 29;
-    }
-    char name[96], mname[104];
-    std::snprintf(name, sizeof name, "Local\\SimpleChessFX_%016llx_%llu",
-                  static_cast<unsigned long long>(h), static_cast<unsigned long long>(bytes));
-    std::snprintf(mname, sizeof mname, "%s_m", name);
-    HANDLE mtx = CreateMutexA(nullptr, FALSE, mname);
-    if (!mtx) return nullptr;
-    const DWORD wr = WaitForSingleObject(mtx, 120000);
-    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) { CloseHandle(mtx); return nullptr; }
-    void* view = nullptr;
-    bool created = false, large = false;
-    HANDLE sec = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
-    if (sec) {
-        view = MapViewOfFile(sec, FILE_MAP_READ | FILE_MAP_LARGE_PAGES, 0, 0, 0);
-        large = view != nullptr;
-        if (!view) view = MapViewOfFile(sec, FILE_MAP_READ, 0, 0, 0);
-        if (view && std::memcmp(view, fx.data(), bytes) != 0) { UnmapViewOfFile(view); view = nullptr; }
-    } else {
-        static const bool priv = sc_enable_lock_pages_nnue();
-        const std::size_t gran = GetLargePageMinimum();
-        if (priv && gran) {
-            const std::size_t r = (bytes + gran - 1) / gran * gran;
-            sec = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
-                                     static_cast<DWORD>(r >> 32), static_cast<DWORD>(r), name);
-            if (sec) {
-                view = MapViewOfFile(sec, FILE_MAP_WRITE | FILE_MAP_LARGE_PAGES, 0, 0, 0);
-                if (!view) view = MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 0);
-                if (!view) { CloseHandle(sec); sec = nullptr; }
-                large = view != nullptr;
-            }
-        }
-        if (!sec) {
-            sec = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
-                                     static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), name);
-            if (sec) view = MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, 0);
-        }
-        if (view) { std::memcpy(view, fx.data(), bytes); created = true; }
-    }
-    ReleaseMutex(mtx);
-    CloseHandle(mtx);
-    if (std::getenv("SCNNUE_FXSHARE_LOG"))
-        std::fprintf(stderr, "FXS: %s %s pages\n", view ? (created ? "created" : "opened") : "private",
-                     large ? "large" : "small");
-    if (!view) { if (sec) CloseHandle(sec); return nullptr; }
-    return std::shared_ptr<const std::int32_t>(static_cast<const std::int32_t*>(view),
-                                               [sec](const std::int32_t* v) { UnmapViewOfFile(v); CloseHandle(sec); });
-#else
-    const std::size_t nw = ti * hl, bytes = nw * sizeof(std::int32_t);
-    if (l0w.size() != nw || nw == 0 || std::getenv("SCNNUE_NOFXSHARE")) return nullptr;
-    std::uint64_t key = 1469598103934665603ull;
-    auto mix = [&key](std::uint64_t v) { key = (key ^ v) * 1099511628211ull; };
-    mix(ti); mix(hl); mix(FX_SHIFT);
-    for (float w : l0w) { std::uint32_t u; std::memcpy(&u, &w, 4); mix(u); }
-    const char* dir = std::getenv("TMPDIR");
-    std::string path = std::string(dir && *dir ? dir : "/tmp");
-    if (path.back() != '/') path += '/';
-    char name[48];
-    std::snprintf(name, sizeof(name), "simplechess-fx-%016llx.i32", static_cast<unsigned long long>(key));
-    path += name;
-
-    const int lfd = ::open((path + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
-    if (lfd < 0) return nullptr;
-    void* map = MAP_FAILED;
-    if (::flock(lfd, LOCK_EX) == 0) {
-        int fd = ::open(path.c_str(), O_RDONLY);
-        struct stat st{};
-        if (fd >= 0 && (::fstat(fd, &st) != 0 || static_cast<std::size_t>(st.st_size) != bytes)) {
-            ::close(fd);
-            fd = -1;
-        }
-        if (fd < 0) {   // first process for this net: convert and publish
-            std::vector<std::int32_t> fx(nw);
-            for (std::size_t i = 0; i < nw; ++i)
-                fx[i] = static_cast<std::int32_t>(std::lround(double(l0w[i]) * FX_S));
-            const std::string tmp = path + "." + std::to_string(::getpid()) + ".tmp";
-            const int wfd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-            bool ok = wfd >= 0;
-            const char* src = reinterpret_cast<const char*>(fx.data());
-            for (std::size_t done = 0; ok && done < bytes;) {
-                const ssize_t w = ::write(wfd, src + done, bytes - done);
-                if (w <= 0) ok = false;
-                else done += static_cast<std::size_t>(w);
-            }
-            if (wfd >= 0 && ::close(wfd) != 0) ok = false;
-            if (ok && ::rename(tmp.c_str(), path.c_str()) == 0) fd = ::open(path.c_str(), O_RDONLY);
-            else ::unlink(tmp.c_str());
-        }
-        if (fd >= 0) {
-            map = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
-            ::close(fd);
-        }
-        ::flock(lfd, LOCK_UN);
-    }
-    ::close(lfd);
-    if (map == MAP_FAILED) return nullptr;
-    return std::shared_ptr<const std::int32_t>(static_cast<const std::int32_t*>(map),
-                                               [bytes](const std::int32_t* p) { ::munmap(const_cast<std::int32_t*>(p), bytes); });
-#endif
-}
-bool g_base_only = false;  // SCNNUE_BASEONLY profiling probe (skip threats+pp)
-bool g_no_accum = false;   // SCNNUE_NOACCUM profiling probe (enumerate, skip column adds)
-bool g_verify = false;     // SCNNUE_VERIFY: cross-check incremental base vs recompute
-unsigned g_net_gen = 0;    // bumped on every successful load (K1: Finny caches hold column sums)
-int g_squeeze = 0;         // SCNNUE_SQUEEZE=N: fold threat/pp columns into N (cache probe)
-bool g_no_update = false;  // SCNNUE_NOUPDATE: skip the threat/pp delta in acc_make (cost probe)
-bool g_no_finny = false;   // SCNNUE_NOFINNY: force king moves to full refresh (A/B the finny path)
-bool g_prefetch = true;    // SCNNUE_NOPREFETCH: disable FT-row prefetch in acc_make (A/B)
-// NPS 3.6 campaign item P1: prefetch EVERY cache line of a feature column the moment the
-// delta enumeration emits it (a 512-byte int8 column is four 128-byte lines on Apple
-// Silicon), instead of only the first line of each column after the enumeration ends.
-// A prefetch cannot change any value -> bit-identical.
-// x86 keeps the first-line form: on the i7-9700 it measured +2.15% faster than every line.
-#ifndef SC_NPS_P1
-#if defined(__x86_64__) || defined(_M_X64)
-#define SC_NPS_P1 0
-#else
-#define SC_NPS_P1 1
-#endif
-#endif
-// The prefetch stride: the cache line (128 bytes on Apple Silicon, 64 on x86).
-#if defined(__APPLE__) && defined(__aarch64__)
-constexpr std::size_t kCacheLine = 128;
-#else
-constexpr std::size_t kCacheLine = 64;
-#endif
-// Prefetch shape knobs (x86 tuning): the stride of the P1 form (0 = kCacheLine), and how many
-// lines per column the P1=0 form fetches after the enumeration (at that stride).
-#ifndef SC_NPS_PF_STRIDE
-#define SC_NPS_PF_STRIDE 0
-#endif
-#ifndef SC_NPS_PF_N   // x86: none at all (i7-9700: +0.40% over the first line, which beat every line)
-#if defined(__x86_64__) || defined(_M_X64)
-#define SC_NPS_PF_N 0
-#else
-#define SC_NPS_PF_N 1
-#endif
-#endif
-constexpr std::size_t kPfStride = SC_NPS_PF_STRIDE ? SC_NPS_PF_STRIDE : kCacheLine;
-// Locality hint of those column prefetches (3 = all levels / prefetcht0, 1 = L2 and out / prefetcht2).
-#ifndef SC_NPS_PF_LOC
-#define SC_NPS_PF_LOC 3
-#endif
-bool g_no_cols = false;    // SCNNUE_NOCOLS: skip apply_diff column ops (isolate enum vs column cost)
-bool g_direct = true;      // SCNNUE_NODIRECT: use the old collect+sort+merge-diff delta instead (A/B + fallback)
-bool g_l1dense = false;    // SCNNUE_L1DENSE: force the dense float L1 matvec (A/B vs NNZ sparse)
-bool g_i8body = false;     // SCNNUE_I8BODY=1: opt into the (lossy, post-hoc) int8 body; default is
-                           // the bit-identical float body. Post-hoc int8 flips bestmoves (~3cp noise)
-                           // for only ~3% nps; a real int8 body needs quantization-aware retrain (4.4).
-
-template <class Vec>   // std::vector<float> or the 64-B-aligned WVec<float> (G3)
-bool read_arr(std::istream& f, Vec& dst, std::uint32_t expect) {
-    std::uint32_t n = 0;
-    f.read(reinterpret_cast<char*>(&n), 4);
-    if (!f || n != expect) return false;
-    dst.resize(n);
-    f.read(reinterpret_cast<char*>(dst.data()),
-           static_cast<std::streamsize>(n) * static_cast<std::streamsize>(sizeof(typename Vec::value_type)));
-    return static_cast<bool>(f);
-}
-bool read_i16(std::istream& f, std::vector<std::int16_t>& dst, std::uint32_t expect) {
-    std::uint32_t n = 0;
-    f.read(reinterpret_cast<char*>(&n), 4);
-    if (!f || n != expect) return false;
-    dst.resize(n);
-    f.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(n) * 2);
-    return static_cast<bool>(f);
-}
-template <class Vec>   // std::vector<int8_t> or the 64-B-aligned WVec<int8_t> (G3)
-bool read_i8(std::istream& f, Vec& dst, std::uint32_t expect) {
-    std::uint32_t n = 0;
-    f.read(reinterpret_cast<char*>(&n), 4);
-    if (!f || n != expect) return false;
-    dst.resize(n);
-    f.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(n));
-    return static_cast<bool>(f);
-}
-
-[[maybe_unused]] inline float crelu(float x) { return std::clamp(x, 0.0f, 1.0f); }
-inline float screlu(float x) {
-    const float c = std::clamp(x, 0.0f, 1.0f);
-    return c * c;
-}
-
-}  // namespace
-
-namespace {
-void permute_neurons(Net& n);   // S1; defined after gather()
-}
-
-static bool load_stream(std::istream& f) {
-
-    char magic[4];
-    f.read(magic, 4);
-    if (!f) return false;
-    const bool is_scn4 = std::memcmp(magic, "SCN4", 4) == 0;  // float
-    const bool is_scn5 = std::memcmp(magic, "SCN5", 4) == 0;  // quantised (int8 FT)
-    if (!is_scn4 && !is_scn5) return false;
-
-    std::uint32_t hdr[5];
-    f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-    if (!f) return false;
-    if ((is_scn4 && hdr[0] != 4) || (is_scn5 && hdr[0] != 5)) return false;  // version
-
-    Net n;
-    n.quant = is_scn5;
-    n.hl = int(hdr[1]);
-    n.input_buckets = int(hdr[2]);
-    n.l2 = int(hdr[3]);
-    n.out_buckets = int(hdr[4]);
-    // Only the shape the eval code is written for loads (a self-consistent file of another shape
-    // would otherwise load "successfully" and then index out of range or divide by zero):
-    //   input buckets == the king-bucket count of BUCKET_LAYOUT (king_bucket() returns 0..9),
-    //   hl a multiple of 64 up to MAX_HL (the accumulator and pairwise SIMD loops; stack buffers),
-    //   l2 a multiple of 16 up to MAX_L2 (the int8 dot loops step 16; stack buffers),
-    //   1..32 output buckets (the output bucket divides the 32 men by the count).
-    // The bounds also keep every array size below in 32 bits. Header fields are unsigned, so a
-    // huge value turns negative here and fails the lower bounds.
-    if (n.input_buckets != kKingBuckets || n.hl < 64 || n.hl > MAX_HL || n.hl % 64 != 0 ||
-        n.l2 < 16 || n.l2 > MAX_L2 || n.l2 % 16 != 0 || n.out_buckets < 1 || n.out_buckets > 32)
-        return false;
-    const std::uint32_t HL = hdr[1], IB = hdr[2], L2 = hdr[3], OB = hdr[4];
-    {   // output bucket of each piece count: (men - 2) / ceil(32 / OB), clamped to [0, OB)
-        const int ob = n.out_buckets, divisor = (32 + ob - 1) / ob;
-        for (int men = 0; men < 65; ++men)
-            n.obucket[men] = static_cast<std::uint8_t>(std::clamp((men - 2) / divisor, 0, ob - 1));
-    }
-    n.base_dims = 768ull * IB;
-    n.total_inputs = n.base_dims + THREAT_DIMS + PP_DIMS;
-    const std::uint32_t TI = static_cast<std::uint32_t>(n.total_inputs);
-
-    bool ok;
-    if (is_scn4) {
-        ok = read_arr(f, n.l0w, TI * HL)
-          && read_arr(f, n.l0b, HL)
-          && read_arr(f, n.l1w, OB * L2 * HL)
-          && read_arr(f, n.l1b, OB * L2)
-          && read_arr(f, n.l2w, OB * 32u * L2)
-          && read_arr(f, n.l2b, OB * 32u)
-          && read_arr(f, n.l3w, OB * 32u)
-          && read_arr(f, n.l3b, OB);
-    } else {
-        ok = read_i8(f, n.l0w_i8, TI * HL)
-          && read_i16(f, n.l0b_i, HL)
-          && read_i8(f, n.l1w_i, OB * L2 * HL)
-          && read_arr(f, n.l1b, OB * L2)
-          && read_arr(f, n.l2w, OB * 32u * L2)
-          && read_arr(f, n.l2b, OB * 32u)
-          && read_arr(f, n.l3w, OB * 32u)
-          && read_arr(f, n.l3b, OB);
-    }
-    if (!ok) return false;
-
-    if (n.quant) {  // transpose L1 to [bucket*L2 + o][HL] (HL contiguous) for sdot
-        const std::size_t OBL2 = static_cast<std::size_t>(OB) * L2;
-        n.l1w_dot.resize(OBL2 * HL);
-        for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-            for (std::uint32_t o = 0; o < L2; ++o)
-                for (std::uint32_t i = 0; i < HL; ++i)
-                    n.l1w_dot[(bkt * L2 + o) * HL + i] = n.l1w_i[static_cast<std::size_t>(i) * OBL2 + bkt * L2 + o];
-        // int8 body layouts + per-layer global scales (see finish_body int8 path).
-        float m2 = 0.0f, m3 = 0.0f;
-        for (float w : n.l2w) m2 = std::max(m2, std::fabs(w));
-        for (float w : n.l3w) m3 = std::max(m3, std::fabs(w));
-        n.l2_scale = m2 > 0.0f ? 127.0f / m2 : 1.0f;
-        n.l3_scale = m3 > 0.0f ? 127.0f / m3 : 1.0f;
-        auto q8 = [](float v) -> std::int8_t {
-            return static_cast<std::int8_t>(std::clamp<long>(std::lround(v), -127, 127));
-        };
-        n.l2w_dot.resize(static_cast<std::size_t>(OB) * 32 * L2);
-        for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-            for (std::uint32_t o = 0; o < 32; ++o)
-                for (std::uint32_t i = 0; i < L2; ++i)
-                    n.l2w_dot[(static_cast<std::size_t>(bkt) * 32 + o) * L2 + i] =
-                        q8(n.l2w[static_cast<std::size_t>(i) * (OB * 32) + bkt * 32 + o] * n.l2_scale);
-        n.l3w_dot.resize(static_cast<std::size_t>(OB) * 32);
-        for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-            for (std::uint32_t i = 0; i < 32; ++i)
-                n.l3w_dot[static_cast<std::size_t>(bkt) * 32 + i] = q8(n.l3w[static_cast<std::size_t>(i) * OB + bkt] * n.l3_scale);
-    } else {  // float labeler: fixed-point FT weights/bias for the incremental accumulator
-        const std::size_t NW = static_cast<std::size_t>(TI) * HL;
-        if constexpr (SC_FX_SHARE) n.l0w_fx_shared = fx_share_map(n.l0w, TI, HL);
-        if (!n.l0w_fx_shared) {
-            n.l0w_fx.resize(NW);
-            for (std::size_t i = 0; i < NW; ++i)
-                n.l0w_fx[i] = static_cast<std::int32_t>(std::lround(double(n.l0w[i]) * FX_S));
-        }
-        n.l0w_fx_p = n.l0w_fx_shared ? n.l0w_fx_shared.get() : n.l0w_fx.data();
-        n.l0b_fx.resize(HL);
-        for (std::uint32_t j = 0; j < HL; ++j)
-            n.l0b_fx[j] = static_cast<std::int32_t>(std::lround(double(n.l0b[j]) * FX_S));
-        // eval_float now reads the fixed-point accumulator; the float FT weights/bias
-        // are no longer needed -> free them (l0w_fx int32 replaces l0w float: net-neutral).
-        std::vector<float>().swap(n.l0w);
-        std::vector<float>().swap(n.l0b);
-    }
-
-    // L3 weights transposed to [bucket][32] so finish_body reads a contiguous row instead of a
-    // stride-OB gather (both net formats; the sequential fma chain is unchanged). x86 campaign A6.
-    n.l3w_t.resize(static_cast<std::size_t>(OB) * 32);
-    for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-        for (std::uint32_t i = 0; i < 32; ++i)
-            n.l3w_t[static_cast<std::size_t>(bkt) * 32 + i] = n.l3w[static_cast<std::size_t>(i) * OB + bkt];
-    // L2 weights bucket-major [(b*L2 + i)*32 + o] so the AVX2 matvec walks 4 KB contiguous
-    // per bucket instead of 32 rows at a 1 KB stride (same fma per lane, same i order). x86 campaign G2.
-    n.l2w_bm.resize(static_cast<std::size_t>(OB) * L2 * 32);
-    for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-        for (std::uint32_t i = 0; i < L2; ++i)
-            for (std::uint32_t o = 0; o < 32; ++o)
-                n.l2w_bm[(static_cast<std::size_t>(bkt) * L2 + i) * 32 + o] =
-                    n.l2w[static_cast<std::size_t>(i) * (OB * 32) + bkt * 32 + o];
-    // Float-net L1 the same way (the AVX2 input-major L1 reads the 32 weights of one input: contiguous
-    // per bucket instead of rows at a 1 KB stride; same values, same fma order).
-    if ((SC_FX_AVX2 || SC_FX_L1BM_NEON) && !n.quant && L2 == 32) {
-        n.l1w_bm.resize(static_cast<std::size_t>(OB) * HL * 32);
-        for (std::uint32_t bkt = 0; bkt < OB; ++bkt)
-            for (std::uint32_t i = 0; i < HL; ++i)
-                for (std::uint32_t o = 0; o < 32; ++o)
-                    n.l1w_bm[(static_cast<std::size_t>(bkt) * HL + i) * 32 + o] =
-                        n.l1w[static_cast<std::size_t>(i) * (OB * L2) + bkt * L2 + o];
-    }
-    build_tables();
-    if constexpr (SC_NPS_S1)
-        if (n.quant) permute_neurons(n);
-    g_base_only = std::getenv("SCNNUE_BASEONLY") != nullptr;
-    g_no_accum = std::getenv("SCNNUE_NOACCUM") != nullptr;
-    g_verify = std::getenv("SCNNUE_VERIFY") != nullptr;
-    g_no_finny = std::getenv("SCNNUE_NOFINNY") != nullptr;
-    g_prefetch = std::getenv("SCNNUE_NOPREFETCH") == nullptr;
-    g_no_cols = std::getenv("SCNNUE_NOCOLS") != nullptr;
-    { const char* q = std::getenv("SCNNUE_SQUEEZE"); g_squeeze = q ? std::atoi(q) : 0; }
-    g_no_update = std::getenv("SCNNUE_NOUPDATE") != nullptr;
-    g_direct = std::getenv("SCNNUE_NODIRECT") == nullptr;
-    g_l1dense = std::getenv("SCNNUE_L1DENSE") != nullptr;
-    g_i8body = std::getenv("SCNNUE_I8BODY") != nullptr;
-    n.loaded = true;
-    g_net = std::move(n);
-    ++g_net_gen;
-    return true;
-}
-
-bool load(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    return load_stream(f);
-}
-
-// Same loader over an in-memory image of a net file (the embedded net, see embed_net.hpp): a
-// read-only streambuf over the bytes, so the parser is shared and the two paths cannot diverge.
-bool load_memory(const void* data, std::size_t size) {
-    if (data == nullptr || size == 0) return false;
-    struct membuf : std::streambuf {
-        membuf(const char* b, std::size_t n) {
-            char* c = const_cast<char*>(b);
-            setg(c, c, c + n);
-        }
-    } buf(static_cast<const char*>(data), size);
-    std::istream f(&buf);
-    return load_stream(f);
-}
-
-bool loaded() noexcept { return g_net.loaded; }
-
-namespace {
-
-// Enumerate the active features (base + threats + pp), invoking add_stm(feat) /
-// add_ntm(feat) for each. Shared verbatim by the float and quantised paths so
-// the two can never drift. `base` = net.base_dims (offset of the threat block).
-template <class AddStm, class AddNtm>
-void gather(const Board& board, std::size_t base, AddStm add_stm, AddNtm add_ntm,
-            bool with_base = true) {
-    const Color stm = board.sideToMove();
-    const bool white = (stm == Color::WHITE);
-    auto rel = [&](int sq) { return white ? sq : (sq ^ 56); };
-
-    // ---- canonical board (mover = white), mirroring threat_inputs.rs ----
-    std::uint64_t occ = 0, by_piece[16] = {0};
-    int piece_on[64];
-    for (int& p : piece_on) p = 255;
-    static constexpr std::array<PieceType::underlying, 6> kTypes = {
-        PieceType::PAWN, PieceType::KNIGHT, PieceType::BISHOP,
-        PieceType::ROOK, PieceType::QUEEN, PieceType::KING};
-    static constexpr std::array<Color, 2> kColors = {Color::WHITE, Color::BLACK};
-    for (int t = 0; t < 6; ++t)
-        for (Color col : kColors) {
-            const int ccolor = (col == stm) ? 0 : 1;   // 0 = mover = white
-            const int sf = (ccolor << 3) | (t + 1);
-            Bitboard bb = board.pieces(PieceType(kTypes[t]), col);
-            while (bb) {
-                const int csq = rel(bb.pop());
-                occ |= 1ull << csq;
-                by_piece[sf] |= 1ull << csq;
-                piece_on[csq] = sf;
-            }
-        }
-    // bulletformat stores our_ksq = mover king (canonical), opp_ksq = opponent
-    // king canonical square ^ 56 (see ChessBoard::from_str). The trainer's
-    // ChessBucketsMirrored + threat orientation both read pos.opp_ksq(), so the
-    // engine must apply the same ^56 to opp_ksq to match the ntm king bucket.
-    const int our_ksq = rel(board.kingSq(stm).index());
-    const int opp_ksq = rel(board.kingSq(white ? Color::BLACK : Color::WHITE).index()) ^ 56;
-    const int stm_orient = orient_tbl(our_ksq);
-    const int ntm_orient = orient_tbl(opp_ksq) ^ 56;
-
-    // ---- base : king-bucketed mirrored HalfKA-768 (ChessBucketsMirrored) ----
-    // Skipped when the incremental accumulator already holds the base sum.
-    if (with_base) {
-        const int stm_flip = (file_of(our_ksq) > 3) ? 7 : 0;
-        const int ntm_flip = (file_of(opp_ksq) > 3) ? 7 : 0;
-        const int stm_bucket = 768 * king_bucket(our_ksq);
-        const int ntm_bucket = 768 * king_bucket(opp_ksq);
-        for (int sf : {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14}) {
-            const int c = (sf >> 3) & 1;
-            const int t0 = (sf & 7) - 1;
-            std::uint64_t bb = by_piece[sf];
-            while (bb) {
-                const int csq = __builtin_ctzll(bb);
-                bb &= bb - 1;
-                const int stm = (c == 0 ? 0 : 384) + 64 * t0 + csq;
-                const int ntm = (c == 0 ? 384 : 0) + 64 * t0 + (csq ^ 56);
-                add_stm(stm_bucket + (stm ^ stm_flip));
-                add_ntm(ntm_bucket + (ntm ^ ntm_flip));
-            }
-        }
-    }
-
-    if (g_base_only) return;  // profiling probe
-
-    // ---- threats : FullThreats (accumulate each perspective independently) ----
-    auto push_threat = [&](int attacker_abs, int from, int to, int attacked_abs) {
-        const std::uint32_t s =
-            make_threat_index(attacker_abs, from ^ stm_orient, to ^ stm_orient, attacked_abs);
-        if (s < static_cast<std::uint32_t>(THREAT_DIMS)) add_stm(base + (g_squeeze ? (s % g_squeeze) : s));
-        const std::uint32_t nn =
-            make_threat_index(attacker_abs ^ 8, from ^ ntm_orient, to ^ ntm_orient, attacked_abs ^ 8);
-        if (nn < static_cast<std::uint32_t>(THREAT_DIMS)) add_ntm(base + (g_squeeze ? (nn % g_squeeze) : nn));
-    };
-
-    const std::uint64_t pawn_targets = by_piece[2] | by_piece[10] | by_piece[4] | by_piece[12];
-    for (int color = 0; color < 2; ++color) {
-        const int attacker_abs = (color == 0) ? SF_W_PAWN : SF_B_PAWN;
-        std::uint64_t bb = by_piece[attacker_abs];
-        while (bb) {
-            const int from = __builtin_ctzll(bb);
-            bb &= bb - 1;
-            std::uint64_t a = pawn_attacks(color, from) & pawn_targets;
-            while (a) {
-                const int to = __builtin_ctzll(a);
-                a &= a - 1;
-                push_threat(attacker_abs, from, to, piece_on[to]);
-            }
-        }
-    }
-    const std::uint64_t nn = by_piece[2] | by_piece[10];
-    const std::uint64_t bsh = by_piece[3] | by_piece[11];
-    const std::uint64_t rk = by_piece[4] | by_piece[12];
-    const std::uint64_t qn = by_piece[5] | by_piece[13];
-    const std::uint64_t pn = by_piece[SF_W_PAWN] | by_piece[SF_B_PAWN];
-    const std::uint64_t minor_slider_targets = pn | nn | bsh | rk;
-    const std::uint64_t queen_targets = pn | nn | bsh | rk | qn;
-    for (int color = 0; color < 2; ++color)
-        for (int pt = 2; pt <= 5; ++pt) {
-            const int sf = (color << 3) | pt;
-            std::uint64_t bb = by_piece[sf];
-            const std::uint64_t targets = (pt == 2 || pt == 5) ? queen_targets : minor_slider_targets;
-            while (bb) {
-                const int from = __builtin_ctzll(bb);
-                bb &= bb - 1;
-                std::uint64_t a = attacks_bb(pt, from, occ) & targets;
-                while (a) {
-                    const int to = __builtin_ctzll(a);
-                    a &= a - 1;
-                    push_threat(sf, from, to, piece_on[to]);
-                }
-            }
-        }
-
-    // ---- pp : PP_3Wide (pawn pairs in the 3-wide band) ----
-    auto emit_pp = [&](int color_abs, int from, int to, int paired_abs) {
-        auto pp_one = [&](int orient, int persp) -> std::size_t {
-            const int fo = (from ^ orient), to_o = (to ^ orient);
-            const int ca = color_abs ^ persp, cb = paired_abs ^ persp;
-            const int id_a = 48 * ca + (fo - 8);
-            const int id_b = 48 * cb + (to_o - 8);
-            const int hi = std::max(id_a, id_b), lo = std::min(id_a, id_b);
-            return static_cast<std::size_t>(hi * (hi - 1) / 2 + lo + PP_INDEX_BASE);
-        };
-        add_stm(base + (g_squeeze ? (pp_one(stm_orient, 0) % g_squeeze) : pp_one(stm_orient, 0)));
-        add_ntm(base + (g_squeeze ? (pp_one(ntm_orient, 1) % g_squeeze) : pp_one(ntm_orient, 1)));
-    };
-    const std::uint64_t white_pawns = by_piece[SF_W_PAWN];
-    const std::uint64_t black_pawns = by_piece[SF_B_PAWN];
-    {
-        std::uint64_t bb = white_pawns;
-        while (bb) {
-            const int from = __builtin_ctzll(bb);
-            bb &= bb - 1;
-            const std::uint64_t band = g_tab.pawn_pair[from];
-            std::uint64_t ww = band & bb;
-            while (ww) { const int to = __builtin_ctzll(ww); ww &= ww - 1; emit_pp(0, from, to, 0); }
-            std::uint64_t wb = band & black_pawns;
-            while (wb) { const int to = __builtin_ctzll(wb); wb &= wb - 1; emit_pp(0, from, to, 1); }
-        }
-        bb = black_pawns;
-        while (bb) {
-            const int from = __builtin_ctzll(bb);
-            bb &= bb - 1;
-            const std::uint64_t band = g_tab.pawn_pair[from];
-            std::uint64_t bk = band & bb;
-            while (bk) { const int to = __builtin_ctzll(bk); bk &= bk - 1; emit_pp(1, from, to, 1); }
-        }
-    }
-
-}  // gather
-
-// ---- S1: neuron permutation + sparse-L1 weight layout ---------------------------
-// Reorders the hidden neurons by how often their pairwise activation is zero (most often first),
-// measured over deterministic random games from the start position (160 plies, so later phases
-// count too), then lays L1 out by 4-input
-// chunk. A neuron j moves as a unit: its two accumulator halves (j, j + hl/2), its FT bias, its FT
-// weight in every feature row, and its L1 weight in both the side-to-move and the other block.
-// Every L1 sum is the same integer in any neuron order, so the evaluation is unchanged.
-void permute_neurons(Net& n) {
-    const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
-    const std::size_t TI = n.total_inputs;
-    const std::int8_t* l0 = n.l0w_i8.data();
-
-    std::vector<std::uint32_t> zeros(static_cast<std::size_t>(half), 0);
-    std::vector<std::int16_t> a_stm(static_cast<std::size_t>(hl)), a_ntm(static_cast<std::size_t>(hl));
-    std::uint64_t rng = 0x9E3779B97F4A7C15ull;
-    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
-    auto cr = [](int x) { return x < 0 ? 0 : (x > QA ? QA : x); };
-    for (int game = 0; game < 128; ++game) {
-        Board b;
-        for (int ply = 0; ply < 160; ++ply) {
-            if (ply >= 6) {
-                for (int j = 0; j < hl; ++j) a_stm[j] = a_ntm[j] = n.l0b_i[j];
-                gather(
-                    b, n.base_dims,
-                    [&](std::size_t f) { const std::int8_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a_stm[j] += w[j]; },
-                    [&](std::size_t f) { const std::int8_t* w = l0 + f * hl; for (int j = 0; j < hl; ++j) a_ntm[j] += w[j]; });
-                for (int j = 0; j < half; ++j) {
-                    zeros[j] += (cr(a_stm[j]) * cr(a_stm[j + half]) / QA == 0);
-                    zeros[j] += (cr(a_ntm[j]) * cr(a_ntm[j + half]) / QA == 0);
-                }
-            }
-            Movelist ml;
-            chess::movegen::legalmoves(ml, b);
-            if (ml.empty()) break;
-            b.makeMove(ml[static_cast<int>(next() % static_cast<std::uint64_t>(ml.size()))]);
-        }
-    }
-    std::vector<int> perm(static_cast<std::size_t>(half));
-    for (int j = 0; j < half; ++j) perm[j] = j;
-    std::stable_sort(perm.begin(), perm.end(), [&](int x, int y) { return zeros[x] > zeros[y]; });
-
-    // FT weights (every feature row) and bias.
-    std::vector<std::int8_t> row8(static_cast<std::size_t>(hl));
-    for (std::size_t r = 0; r < TI; ++r) {
-        std::int8_t* row = n.l0w_i8.data() + r * hl;
-        for (int j = 0; j < half; ++j) { row8[j] = row[perm[j]]; row8[half + j] = row[half + perm[j]]; }
-        std::memcpy(row, row8.data(), static_cast<std::size_t>(hl));
-    }
-    std::vector<std::int16_t> b16(n.l0b_i);
-    for (int j = 0; j < half; ++j) { n.l0b_i[j] = b16[perm[j]]; n.l0b_i[half + j] = b16[half + perm[j]]; }
-    // L1 inputs: [0, half) the side to move's neurons, [half, hl) the other side's.
-    for (std::size_t r = 0; r < static_cast<std::size_t>(OB) * L2; ++r) {
-        std::int8_t* row = n.l1w_dot.data() + r * hl;
-        for (int j = 0; j < half; ++j) { row8[j] = row[perm[j]]; row8[half + j] = row[half + perm[j]]; }
-        std::memcpy(row, row8.data(), static_cast<std::size_t>(hl));
-    }
-    // Sparse layout: [bucket][chunk k][output o][4 inputs 4k..4k+3].
-    const int nch = hl / 4;
-    n.l1w_sp.resize(static_cast<std::size_t>(OB) * nch * L2 * 4);
-    for (int bkt = 0; bkt < OB; ++bkt)
-        for (int k = 0; k < nch; ++k)
-            for (int o = 0; o < L2; ++o)
-                for (int t = 0; t < 4; ++t)
-                    n.l1w_sp[((static_cast<std::size_t>(bkt) * nch + k) * L2 + o) * 4 + t] =
-                        n.l1w_dot[(static_cast<std::size_t>(bkt) * L2 + o) * hl + 4 * k + t];
-}
 
 // ---- incremental base accumulator (thread-local) ----------------------------
 // Persistent per-perspective BASE accumulator (int16), maintained across
@@ -1258,38 +161,8 @@ struct BB {
 // normal move reads its before-state from bb[ply] instead of rebuilding a BB from board.at()
 // every make. Same ply / reset / make / unmake / null hooks.
 
-// Item #9 (novelty ledger): how many NEW attacks on a HIGHER-valued enemy piece the last acc_make's
-// move created, counted for the mover's side only. The threat-delta emitter already has the attacker
-// and the victim in hand for every column it adds, so this is two comparisons per emission rather
-// than any new enumeration -- the same "read what the net already computed" shape as item #8, but a
-// semantically sharp count (this move makes a threat) instead of a magnitude of feature change.
-// Zero on the king-cross refresh path, where the threat set is rebuilt rather than emitted as a
-// delta: a false negative on a few percent of moves, never a false positive.
 
-// Squares of all pieces attacking `s` (both colors).
-inline std::uint64_t attackers_of(const BB& bb, int s) {
-    const std::uint64_t N = bb.by[2] | bb.by[10], B = bb.by[3] | bb.by[11],
-                        R = bb.by[4] | bb.by[12], Q = bb.by[5] | bb.by[13],
-                        K = bb.by[6] | bb.by[14];
-    std::uint64_t a = 0;
-    a |= knight_attacks(s) & N;
-    a |= king_attacks(s) & K;
-    a |= attacks_bb(3, s, bb.occ) & (B | Q);
-    a |= attacks_bb(4, s, bb.occ) & (R | Q);
-    a |= bb.by[SF_W_PAWN] & pawn_attacks(1, s);  // white pawns that attack s
-    a |= bb.by[SF_B_PAWN] & pawn_attacks(0, s);  // black pawns that attack s
-    return a;
-}
 
-// A thread-local scratch that collects threat/pp feature indices (in
-// [0, THREAT_DIMS+PP_DIMS)) per perspective, so acc_make can apply only the
-// exact multiset difference between the before- and after-move feature sets.
-struct FeatList {
-    std::uint32_t v[2][1024];
-    int n[2] = {0, 0};
-    inline void push(int p, std::uint32_t idx) { v[p][n[p]++] = idx; }
-    inline void clear() { n[0] = n[1] = 0; }
-};
 
 }  // namespace
 
@@ -1301,7 +174,6 @@ struct Context {
     std::vector<AccFx> stack_fx;  // int32 fixed-point accumulators (float labeler net)
     std::vector<BB>    bb;        // per-ply board bitboards, in lockstep with the stack
     int ply = -1;                 // -1 = uninitialised -> evaluate() recomputes from the board
-    int threats_made = 0;         // item #9: see acc_threats_made()
     const void* addp[2][1024];    // delta column scratch (acc_make)
     const void* subp[2][1024];
     const void* ra[40];           // king-rebucket scratch
@@ -1320,49 +192,93 @@ struct Context {
     alignas(64) std::int16_t fb[2][MAX_HL];
     // FXZ: stack_fx[p] holds its values only when fx_ok[p]; otherwise fx_pend[p] has the column lists
     // acc_make recorded for it (adds in col[s][0, na), subs in col[s][na, na + ns)).
-    struct FxPend { int na[2], ns[2]; const std::int32_t* col[2][kFxPendCap]; };
+    // A rebucket (king crossed a bucket, same mirror) is left for that first read too. Only the low part
+    // of each list is ever touched: no zeroing, no copies.
+    struct FxPend {
+        int kind;                       // 0: a normal move (the fields below), 1: a null move
+        int from, to, mcolor, mt0, cpi;
+        bool cap;
+        int rb_color;                   // >= 0: a rebucket of that perspective is pending
+        int na[2], ns[2];
+#if !SC_FX_SCRATCH
+        const std::int32_t* add[2][1024];
+        const std::int32_t* sub[2][1024];
+#endif
+    };
     std::vector<std::uint8_t> fx_ok;
-    std::vector<FxPend> fx_pend;
-#if SC_FXP
+    std::unique_ptr<FxPend[]> fx_pend;
+#if SC_FXP || SC_FXN
     AccFx fx_fb;   // FXP: the float eval's from-scratch fallback (kept out of its frame)
 #endif
-#ifdef SC_LZSTAT
-    std::uint8_t lz_needed[ACC_STACK] = {};   // measurement only: was this ply's accumulator read?
+    // K1 for the float labeler: the int32 column sums, [perspective][mirror][bucket], built on first use.
+    struct FinnyFx {
+        alignas(64) std::int32_t acc[MAX_HL];
+        std::uint64_t by[16];
+        bool valid = false;
+    };
+    std::vector<FinnyFx> finny_fx;
+    Key fx_root_key = 0;            // FXR: stack_fx[0] holds this position, for fx_root_gen's net
+    unsigned fx_root_gen = 0;
+    std::uint32_t fxd[2][2][1024];  // FXD: [before/after][perspective] feature lists of a special move
+    std::vector<std::uint8_t> fxd_count;  // FXD: per feature, built on first use
+#if SC_Q_LAZY
+    // Lazy int8 updates: stack[p] holds its values only when q_ok[p]; otherwise q_pend[p] is the move to apply.
+    struct QPend { std::int8_t kind, from, to, mcolor, mt0, cap, cpi, rb; };   // kind 1: a null move
+    std::uint8_t q_ok[ACC_STACK];
+    QPend q_pend[ACC_STACK];
 #endif
 };
+// A pending ply's column lists: its own, or (SC_FX_SCRATCH) the context's scratch, since a ply's lists live
+// only from its enumeration to the pass right after it.
+using FxLists = const std::int32_t* [2][1024];
+#if SC_FX_SCRATCH
+inline FxLists& fx_adds(Context& cx, Context::FxPend&) { return *reinterpret_cast<FxLists*>(&cx.addp); }
+inline FxLists& fx_subs(Context& cx, Context::FxPend&) { return *reinterpret_cast<FxLists*>(&cx.subp); }
+#else
+inline FxLists& fx_adds(Context&, Context::FxPend& e) { return e.add; }
+inline FxLists& fx_subs(Context&, Context::FxPend& e) { return e.sub; }
+#endif
+
 // FXZ: bring stack_fx[p] up to date from the newest computed ancestor (fx_ok[0] is always set),
 // one ply at a time, each the src->dst fused pass acc_make would have made.
+void fx_enumerate(Context& cx, int k);
+void fx_rebucket(Context& cx, Context::FxPend& e, const BB& bb1);
+
 inline void fx_ensure(Context& cx, int p) {
     if (cx.fx_ok[p]) return;
     int q = p - 1;
     while (!cx.fx_ok[q]) --q;
     const int hl = g_net.hl;
     for (int k = q + 1; k <= p; ++k) {
-        const Context::FxPend& e = cx.fx_pend[k];
+        Context::FxPend& e = cx.fx_pend[k];
+        if (e.kind == 0) fx_enumerate(cx, k);
+        else cx.bb[k] = cx.bb[k - 1];   // a null move: same pieces, empty lists
+        if (e.rb_color >= 0) fx_rebucket(cx, e, cx.bb[k]);
         for (int sd = 0; sd < 2; ++sd)
-            fused_apply_src_fx(cx.stack_fx[k].v[sd], cx.stack_fx[k - 1].v[sd], e.col[sd], e.na[sd],
-                               e.col[sd] + e.na[sd], e.ns[sd], hl);
+            fused_apply_src_fx(cx.stack_fx[k].v[sd], cx.stack_fx[k - 1].v[sd], fx_adds(cx, e)[sd], e.na[sd],
+                               fx_subs(cx, e)[sd], e.ns[sd], hl);
         cx.fx_ok[k] = 1;
     }
 }
-#ifdef SC_LZSTAT
-// Measurement build: how many accumulator updates are popped without that ply or any descendant
-// ever being evaluated (what lazy updates could skip). Printed to stderr at exit.
-std::atomic<long> g_lz_upd{0}, g_lz_skip{0}, g_lz_null{0}, g_lz_null_skip{0};
-// Move kinds acc_make saw: castle, promotion, en passant, king move across the mirror (full refresh),
-// king move across a bucket only (rebucket), other king move.
-std::atomic<long> g_lz_kind[6] = {};
-struct LzPrinter {
-    ~LzPrinter() {
-        std::fprintf(stderr, "LZSTAT updates %ld skipped %ld (%.2f%%) | null %ld skipped %ld\n", g_lz_upd.load(),
-                     g_lz_skip.load(), 100.0 * g_lz_skip.load() / std::max(1L, g_lz_upd.load()), g_lz_null.load(),
-                     g_lz_null_skip.load());
-        std::fprintf(stderr, "LZSTAT kinds castle %ld promo %ld ep %ld kmirror %ld krebucket %ld kother %ld\n",
-                     g_lz_kind[0].load(), g_lz_kind[1].load(), g_lz_kind[2].load(), g_lz_kind[3].load(),
-                     g_lz_kind[4].load(), g_lz_kind[5].load());
+
+#if SC_Q_LAZY
+void q_apply(Context& cx, int k);
+// Bring stack[p] up to date from the newest computed ancestor (q_ok[0] is always set), one ply at a time.
+inline void q_ensure(Context& cx, int p) {
+    if (cx.q_ok[p]) return;
+    int q = p - 1;
+    while (!cx.q_ok[q]) --q;
+    for (int k = q + 1; k <= p; ++k) {
+        q_apply(cx, k);
+        cx.q_ok[k] = 1;
     }
-} g_lz_printer;
+}
 #endif
+
+// EVC: shared by the workers. A small table in static storage until eval_cache_resize, so there is always one.
+std::uint64_t g_evc_boot[1 << 16];
+std::uint64_t* g_evc = g_evc_boot;
+std::size_t g_evc_mask = (1 << 16) - 1;
 
 Context* context_new() { return new Context(); }
 void context_free(Context* c) { delete c; }
@@ -1375,71 +291,8 @@ Context& tl_context() {
 }
 
 
-// Collect all threat feature indices of the piece `sf` on `sq` (board `bb`) into
-// `out`, for both perspectives.
-inline void collect_piece_threats(FeatList& out, const BB& bb, int sq, int sf, int wo, int bo) {
-    const int pt = sf & 7;
-    if (pt == 6 || pt == 0) return;
-    const std::uint64_t N = bb.by[2] | bb.by[10], Bp = bb.by[3] | bb.by[11],
-                        R = bb.by[4] | bb.by[12], Q = bb.by[5] | bb.by[13],
-                        P = bb.by[SF_W_PAWN] | bb.by[SF_B_PAWN];
-    std::uint64_t attacks;
-    if (pt == 1) {
-        attacks = pawn_attacks(sf < 8 ? 0 : 1, sq) & (N | R);
-    } else {
-        const std::uint64_t tgt = (pt == 2 || pt == 5) ? (P | N | Bp | R | Q) : (P | N | Bp | R);
-        attacks = attacks_bb(pt, sq, bb.occ) & tgt;
-    }
-    while (attacks) {
-        const int to = __builtin_ctzll(attacks);
-        attacks &= attacks - 1;
-        const int attacked = bb.piece_on[to];
-        const std::uint32_t s = make_threat_index(sf, sq ^ wo, to ^ wo, attacked);
-        if (s < static_cast<std::uint32_t>(THREAT_DIMS)) out.push(0, s);
-        const std::uint32_t nn = make_threat_index(sf ^ 8, sq ^ bo, to ^ bo, attacked ^ 8);
-        if (nn < static_cast<std::uint32_t>(THREAT_DIMS)) out.push(1, nn);
-    }
-}
 
-// Reduced collect for a NON-SLIDER attacker (knight or pawn; kings are excluded
-// as threat attackers). Their attack set is occupancy-independent, so the only
-// threat of theirs that can change when a piece appears/leaves square `tgt` is
-// their threat TO `tgt`. Push just that one (both perspectives) if they attack
-// `tgt` and the piece there is a valid target. Sliders are NOT routed here — a
-// ray extension/truncation changes threats to squares beyond from/to, so they
-// still need a full recompute.
-inline void collect_ns_threat(FeatList& out, const BB& bb, int a_sq, int a_sf, int tgt,
-                              int wo, int bo) {
-    const int pt = a_sf & 7;
-    const std::uint64_t atk = (pt == 1) ? pawn_attacks(a_sf < 8 ? 0 : 1, a_sq) : knight_attacks(a_sq);
-    if (!(atk & (1ull << tgt))) return;
-    const int attacked = bb.piece_on[tgt];
-    if (attacked < 0) return;
-    const std::uint32_t s = make_threat_index(a_sf, a_sq ^ wo, tgt ^ wo, attacked);
-    if (s < static_cast<std::uint32_t>(THREAT_DIMS)) out.push(0, s);
-    const std::uint32_t nn = make_threat_index(a_sf ^ 8, a_sq ^ bo, tgt ^ bo, attacked ^ 8);
-    if (nn < static_cast<std::uint32_t>(THREAT_DIMS)) out.push(1, nn);
-}
 
-// Collect all pawn-pair (PP_3Wide) feature indices for the pawn on `sq`.
-inline void collect_pp_for_pawn(FeatList& out, const BB& bb, int sq, int color, int wo, int bo) {
-    const std::uint64_t wp = bb.by[SF_W_PAWN], bp = bb.by[SF_B_PAWN];
-    std::uint64_t band = g_tab.pawn_pair[sq] & (wp | bp);
-    auto pp_index = [&](int orient, int persp, int cA, int to, int cB) -> std::uint32_t {
-        const int fo = sq ^ orient, to_o = to ^ orient;
-        const int ca = cA ^ persp, cb = cB ^ persp;
-        const int id_a = 48 * ca + (fo - 8), id_b = 48 * cb + (to_o - 8);
-        const int hi = std::max(id_a, id_b), lo = std::min(id_a, id_b);
-        return static_cast<std::uint32_t>(hi * (hi - 1) / 2 + lo + PP_INDEX_BASE);
-    };
-    while (band) {
-        const int to = __builtin_ctzll(band);
-        band &= band - 1;
-        const int cB = (bp & (1ull << to)) ? 1 : 0;
-        out.push(0, pp_index(wo, 0, color, to, cB));
-        out.push(1, pp_index(bo, 1, color, to, cB));
-    }
-}
 
 // Apply many int8 weight columns to the int16 accumulator in ONE pass: read each
 // 16-wide accumulator chunk once, fold in every add/sub column, write once. This
@@ -1602,33 +455,31 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
     }
     // A2 (NPS 3.6): 128 int16 per chunk, one set of 16 accumulators -- half the chunk iterations
     // and column-pointer reloads of the 64-lane form. Same wrapping int16 sums -> bit-identical.
-    if constexpr (SC_NPS_A2) {
-        for (; c + 128 <= hl; c += 128) {
-            int16x8_t v0 = vld1q_s16(src + c),       v1 = vld1q_s16(src + c + 8),
-                      v2 = vld1q_s16(src + c + 16),  v3 = vld1q_s16(src + c + 24),
-                      v4 = vld1q_s16(src + c + 32),  v5 = vld1q_s16(src + c + 40),
-                      v6 = vld1q_s16(src + c + 48),  v7 = vld1q_s16(src + c + 56),
-                      v8 = vld1q_s16(src + c + 64),  v9 = vld1q_s16(src + c + 72),
-                      v10 = vld1q_s16(src + c + 80), v11 = vld1q_s16(src + c + 88),
-                      v12 = vld1q_s16(src + c + 96), v13 = vld1q_s16(src + c + 104),
-                      v14 = vld1q_s16(src + c + 112), v15 = vld1q_s16(src + c + 120);
-            for (int k = 0; k < na; ++k) {
-                const std::int8_t* P = add[k];   // SCN_COL64 adds the chunk offset c
-                SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vaddq_s16)
-                SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vaddq_s16)
-            }
-            for (int k = 0; k < ns; ++k) {
-                const std::int8_t* P = sub[k];   // SCN_COL64 adds the chunk offset c
-                SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vsubq_s16)
-                SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vsubq_s16)
-            }
-            vst1q_s16(dst + c,       v0);  vst1q_s16(dst + c + 8,   v1);  vst1q_s16(dst + c + 16,  v2);
-            vst1q_s16(dst + c + 24,  v3);  vst1q_s16(dst + c + 32,  v4);  vst1q_s16(dst + c + 40,  v5);
-            vst1q_s16(dst + c + 48,  v6);  vst1q_s16(dst + c + 56,  v7);  vst1q_s16(dst + c + 64,  v8);
-            vst1q_s16(dst + c + 72,  v9);  vst1q_s16(dst + c + 80,  v10); vst1q_s16(dst + c + 88,  v11);
-            vst1q_s16(dst + c + 96,  v12); vst1q_s16(dst + c + 104, v13); vst1q_s16(dst + c + 112, v14);
-            vst1q_s16(dst + c + 120, v15);
+    for (; c + 128 <= hl; c += 128) {
+        int16x8_t v0 = vld1q_s16(src + c),       v1 = vld1q_s16(src + c + 8),
+                  v2 = vld1q_s16(src + c + 16),  v3 = vld1q_s16(src + c + 24),
+                  v4 = vld1q_s16(src + c + 32),  v5 = vld1q_s16(src + c + 40),
+                  v6 = vld1q_s16(src + c + 48),  v7 = vld1q_s16(src + c + 56),
+                  v8 = vld1q_s16(src + c + 64),  v9 = vld1q_s16(src + c + 72),
+                  v10 = vld1q_s16(src + c + 80), v11 = vld1q_s16(src + c + 88),
+                  v12 = vld1q_s16(src + c + 96), v13 = vld1q_s16(src + c + 104),
+                  v14 = vld1q_s16(src + c + 112), v15 = vld1q_s16(src + c + 120);
+        for (int k = 0; k < na; ++k) {
+            const std::int8_t* P = add[k];   // SCN_COL64 adds the chunk offset c
+            SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vaddq_s16)
+            SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vaddq_s16)
         }
+        for (int k = 0; k < ns; ++k) {
+            const std::int8_t* P = sub[k];   // SCN_COL64 adds the chunk offset c
+            SCN_COL64(v0, v1, v2, v3, v4, v5, v6, v7, P, vsubq_s16)
+            SCN_COL64(v8, v9, v10, v11, v12, v13, v14, v15, P + 64, vsubq_s16)
+        }
+        vst1q_s16(dst + c,       v0);  vst1q_s16(dst + c + 8,   v1);  vst1q_s16(dst + c + 16,  v2);
+        vst1q_s16(dst + c + 24,  v3);  vst1q_s16(dst + c + 32,  v4);  vst1q_s16(dst + c + 40,  v5);
+        vst1q_s16(dst + c + 48,  v6);  vst1q_s16(dst + c + 56,  v7);  vst1q_s16(dst + c + 64,  v8);
+        vst1q_s16(dst + c + 72,  v9);  vst1q_s16(dst + c + 80,  v10); vst1q_s16(dst + c + 88,  v11);
+        vst1q_s16(dst + c + 96,  v12); vst1q_s16(dst + c + 104, v13); vst1q_s16(dst + c + 112, v14);
+        vst1q_s16(dst + c + 120, v15);
     }
     for (; c + 64 <= hl; c += 64) {
         int16x8_t v0 = vld1q_s16(src + c),      v1 = vld1q_s16(src + c + 8),
@@ -1745,28 +596,26 @@ inline void fused_apply_src(std::int16_t* dst, const std::int16_t* src, const st
     int c = 0;
     // A2 (NPS 3.6) on AVX2: 128 int16 per chunk, one set of 8 ymm accumulators -- half the chunk
     // iterations and column-pointer reloads of the 64-lane form. int16 adds wrap -> bit-identical.
-    if constexpr (SC_NPS_A2) {
-        for (; c + 128 <= hl; c += 128) {
-            auto ldv = [&](int o) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + o)); };
-            __m256i v0 = ldv(0), v1 = ldv(16), v2 = ldv(32), v3 = ldv(48),
-                    v4 = ldv(64), v5 = ldv(80), v6 = ldv(96), v7 = ldv(112);
-            for (int k = 0; k < na; ++k) {
-                const std::int8_t* p = add[k] + c;
-                v0 = _mm256_add_epi16(v0, w16(p));      v1 = _mm256_add_epi16(v1, w16(p + 16));
-                v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
-                v4 = _mm256_add_epi16(v4, w16(p + 64)); v5 = _mm256_add_epi16(v5, w16(p + 80));
-                v6 = _mm256_add_epi16(v6, w16(p + 96)); v7 = _mm256_add_epi16(v7, w16(p + 112));
-            }
-            for (int k = 0; k < ns; ++k) {
-                const std::int8_t* p = sub[k] + c;
-                v0 = _mm256_sub_epi16(v0, w16(p));      v1 = _mm256_sub_epi16(v1, w16(p + 16));
-                v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
-                v4 = _mm256_sub_epi16(v4, w16(p + 64)); v5 = _mm256_sub_epi16(v5, w16(p + 80));
-                v6 = _mm256_sub_epi16(v6, w16(p + 96)); v7 = _mm256_sub_epi16(v7, w16(p + 112));
-            }
-            auto stv = [&](int o, __m256i v) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + o), v); };
-            stv(0, v0); stv(16, v1); stv(32, v2); stv(48, v3); stv(64, v4); stv(80, v5); stv(96, v6); stv(112, v7);
+    for (; c + 128 <= hl; c += 128) {
+        auto ldv = [&](int o) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c + o)); };
+        __m256i v0 = ldv(0), v1 = ldv(16), v2 = ldv(32), v3 = ldv(48),
+                v4 = ldv(64), v5 = ldv(80), v6 = ldv(96), v7 = ldv(112);
+        for (int k = 0; k < na; ++k) {
+            const std::int8_t* p = add[k] + c;
+            v0 = _mm256_add_epi16(v0, w16(p));      v1 = _mm256_add_epi16(v1, w16(p + 16));
+            v2 = _mm256_add_epi16(v2, w16(p + 32)); v3 = _mm256_add_epi16(v3, w16(p + 48));
+            v4 = _mm256_add_epi16(v4, w16(p + 64)); v5 = _mm256_add_epi16(v5, w16(p + 80));
+            v6 = _mm256_add_epi16(v6, w16(p + 96)); v7 = _mm256_add_epi16(v7, w16(p + 112));
         }
+        for (int k = 0; k < ns; ++k) {
+            const std::int8_t* p = sub[k] + c;
+            v0 = _mm256_sub_epi16(v0, w16(p));      v1 = _mm256_sub_epi16(v1, w16(p + 16));
+            v2 = _mm256_sub_epi16(v2, w16(p + 32)); v3 = _mm256_sub_epi16(v3, w16(p + 48));
+            v4 = _mm256_sub_epi16(v4, w16(p + 64)); v5 = _mm256_sub_epi16(v5, w16(p + 80));
+            v6 = _mm256_sub_epi16(v6, w16(p + 96)); v7 = _mm256_sub_epi16(v7, w16(p + 112));
+        }
+        auto stv = [&](int o, __m256i v) { _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + c + o), v); };
+        stv(0, v0); stv(16, v1); stv(32, v2); stv(48, v3); stv(64, v4); stv(80, v5); stv(96, v6); stv(112, v7);
     }
     for (; c + 64 <= hl; c += 64) {   // 64 int16 per chunk (4 vectors x 2 lanes), src -> dst (A9)
         __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + c));
@@ -1937,35 +786,6 @@ inline void fused_apply_src_fx(std::int32_t* dst, const std::int32_t* src, const
 #endif
 }
 
-// Apply the exact multiset difference (bef -> aft) of feature indices for one
-// perspective: columns only in bef are subtracted, only in aft are added,
-// matched pairs cancel (unchanged features cost no column op).
-inline void apply_diff(std::int16_t* acc, std::uint32_t* bef, int nb, std::uint32_t* aft, int na) {
-    const std::int8_t* l0 = g_net.l0w_i8.data();
-    const int hl = g_net.hl;
-    const std::size_t base = g_net.base_dims;
-    // Features are binary (each present 0/1x in the true feature set), so dedup
-    // each side to a SET before the difference. Without this, a pawn-takes-pawn
-    // collects the (mover,captured) pawn-pair into `bef` twice (once from each
-    // pawn's band -> same symmetric PP index), over-subtracting that column.
-    std::sort(bef, bef + nb);
-    nb = static_cast<int>(std::unique(bef, bef + nb) - bef);
-    std::sort(aft, aft + na);
-    na = static_cast<int>(std::unique(aft, aft + na) - aft);
-    if (g_no_cols) return;  // probe: keep enumeration+sort, skip the column adds
-    static thread_local const std::int8_t* addp[1200];
-    static thread_local const std::int8_t* subp[1200];
-    int nadd = 0, nsub = 0;
-    int i = 0, j = 0;
-    while (i < nb && j < na) {
-        if (bef[i] == aft[j]) { ++i; ++j; }
-        else if (bef[i] < aft[j]) { subp[nsub++] = l0 + (base + bef[i]) * hl; ++i; }
-        else { addp[nadd++] = l0 + (base + aft[j]) * hl; ++j; }
-    }
-    for (; i < nb; ++i) subp[nsub++] = l0 + (base + bef[i]) * hl;
-    for (; j < na; ++j) addp[nadd++] = l0 + (base + aft[j]) * hl;
-    fused_apply(acc, addp, nadd, subp, nsub, hl);
-}
 
 
 // L2/L3 tail. Two numerically-close paths: a float matvec (bit-identical to the
@@ -1974,31 +794,6 @@ inline void apply_diff(std::int16_t* acc, std::uint32_t* bef, int nb, std::uint3
 Value finish_body(const Net& n, const float* x1, int b) {
     const int L2 = n.l2, OB = n.out_buckets;
     float y;
-#if defined(__ARM_FEATURE_DOTPROD)
-    if (g_i8body && !n.l2w_dot.empty()) {
-        // Quantize x1 to int8 [0,127]; L2 = 32 int8 dots (vdotq), dequant, screlu;
-        // quantize x2 to int8; L3 = one 32-wide int8 dot. Biases stay float.
-        const float* l2b = n.l2b.data() + b * 32;
-        alignas(16) std::int8_t xi[MAX_L2];
-        for (int i = 0; i < L2; ++i) xi[i] = static_cast<std::int8_t>(x1[i] * 127.0f + 0.5f);
-        const std::int8_t* w2 = n.l2w_dot.data() + static_cast<std::size_t>(b) * 32 * L2;
-        const float deq2 = 127.0f * n.l2_scale;
-        alignas(16) std::int8_t x2i[MAX_L2];
-        for (int o = 0; o < 32; ++o) {
-            const std::int8_t* wo = w2 + static_cast<std::size_t>(o) * L2;
-            int32x4_t acc = vdupq_n_s32(0);
-            for (int i = 0; i < L2; i += 16) acc = vdotq_s32(acc, vld1q_s8(xi + i), vld1q_s8(wo + i));
-            const float a = screlu(static_cast<float>(vaddvq_s32(acc)) / deq2 + l2b[o]);
-            x2i[o] = static_cast<std::int8_t>(a * 127.0f + 0.5f);
-        }
-        const std::int8_t* w3 = n.l3w_dot.data() + static_cast<std::size_t>(b) * 32;
-        int32x4_t acc3 = vdupq_n_s32(0);
-        for (int i = 0; i < 32; i += 16) acc3 = vdotq_s32(acc3, vld1q_s8(x2i + i), vld1q_s8(w3 + i));
-        y = static_cast<float>(vaddvq_s32(acc3)) / (127.0f * n.l3_scale) + n.l3b[b];
-        const float cp = std::clamp(400.0f * y, -15000.0f, 15000.0f);
-        return static_cast<Value>(std::lround(cp));
-    }
-#endif
     std::array<float, 32> x2{};
     [[maybe_unused]] unsigned nz3 = 0xFFFFFFFFu;   // AVX2: the nonzero x2 (L3S)
     const float* l2w = n.l2w.data();
@@ -2030,12 +825,7 @@ Value finish_body(const Net& n, const float* x1, int b) {
         alignas(16) float tmp[32];
         vst1q_f32(tmp,c0);    vst1q_f32(tmp+4,c1);  vst1q_f32(tmp+8,c2);  vst1q_f32(tmp+12,c3);
         vst1q_f32(tmp+16,c4); vst1q_f32(tmp+20,c5); vst1q_f32(tmp+24,c6); vst1q_f32(tmp+28,c7);
-        if constexpr (SC_NPS_L3S) {
-            nz3 = 0;
-            for (int o = 0; o < 32; ++o) { x2[o] = screlu(tmp[o]); nz3 |= static_cast<unsigned>(x2[o] != 0.0f) << o; }
-        } else {
-            for (int o = 0; o < 32; ++o) x2[o] = screlu(tmp[o]);
-        }
+        for (int o = 0; o < 32; ++o) x2[o] = screlu(tmp[o]);
     } else
     // 32x32 L2 matvec, 4 outputs at a time; per-output i-accumulation fmla chain,
     // matching the fp-contracted scalar -> bit-identical.
@@ -2101,7 +891,7 @@ Value finish_body(const Net& n, const float* x1, int b) {
     y = n.l3b[b];
     {   // contiguous per-bucket L3 row (A6); the sequential fma chain is unchanged -> bit-identical
         const float* w3 = n.l3w_t.data() + static_cast<std::size_t>(b) * 32;
-#if defined(__AVX2__) || (defined(__ARM_NEON) && SC_NPS_L3S)
+#if defined(__AVX2__)
         // L3S: the same chain over the nonzero x2 only, ascending (dropped terms add +0: at most a
         // zero's sign changes, and lround maps +-0 alike). The dense chain is 32 dependent fma.
         if (!g_l1dense) {
@@ -2119,6 +909,7 @@ Value finish_body(const Net& n, const float* x1, int b) {
 // Per 4 lanes, vcgtq_f32>0 -> 4-bit code -> a LUT of set-lane offsets (ascending),
 // advance by popcount. Returns the SAME list as the branchless scalar build (so the
 // sparse matvec is byte-identical); this just builds it faster.
+#if defined(__ARM_NEON)
 static const std::uint8_t kNnzLut[16][4] = {
     {0,0,0,0},{0,0,0,0},{1,0,0,0},{0,1,0,0},{2,0,0,0},{0,2,0,0},{1,2,0,0},{0,1,2,0},
     {3,0,0,0},{0,3,0,0},{1,3,0,0},{0,1,3,0},{2,3,0,0},{0,2,3,0},{1,2,3,0},{0,1,2,3}};
@@ -2127,6 +918,7 @@ static const std::uint8_t kNnzPop[16] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4};
 alignas(8) static const std::uint16_t kNnzLut16[16][4] = {
     {0,0,0,0},{0,0,0,0},{1,0,0,0},{0,1,0,0},{2,0,0,0},{0,2,0,0},{1,2,0,0},{0,1,2,0},
     {3,0,0,0},{0,3,0,0},{1,3,0,0},{0,1,3,0},{2,3,0,0},{0,2,3,0},{1,2,3,0},{0,1,2,3}};
+#endif
 #if defined(__AVX2__)
 // S1 on AVX2: for an 8-bit nonzero-chunk mask, the ascending set-bit offsets (one 128-bit store
 // per 8 chunks, no data-dependent branch).
@@ -2141,8 +933,8 @@ alignas(16) static constexpr auto kNnzLut8 = [] {
 }();
 #endif
 
-inline int build_nnz(const float* h, int n, int* nz) {
 #if defined(__ARM_NEON)
+inline int build_nnz(const float* h, int n, int* nz) {
     int nnz = 0;
     const float32x4_t z = vdupq_n_f32(0.0f);
     const uint32x4_t  bit = {1u, 2u, 4u, 8u};
@@ -2155,17 +947,13 @@ inline int build_nnz(const float* h, int n, int* nz) {
         nnz += kNnzPop[code];
     }
     return nnz;
-#else
-    int nnz = 0;
-    for (int i = 0; i < n; ++i) { nz[nnz] = i; nnz += (h[i] != 0.0f); }
-    return nnz;
-#endif
 }
+#endif
 
 // SWAP=false: the position as it is. SWAP=true: the same accumulator read with the two
 // perspectives exchanged (the position after a pass), negated so the result is from the
 // ORIGINAL side to move's point of view. See evaluate_pass() in nnue.hpp.
-#if SC_FXP
+#if SC_FXP || SC_FXN
 template <bool SWAP>
 [[gnu::noinline]] Value eval_float_t0(Context& cx, const Board& board);
 
@@ -2179,7 +967,9 @@ template <bool SWAP>
             break;
         }
 }
+#endif
 
+#if SC_FXP
 template <bool SWAP>
 [[gnu::noinline]] Value eval_float_t(Context& cx, const Board& board) {   // its buffers stay out of evaluate()'s frame
     const Net& n = g_net;
@@ -2190,9 +980,6 @@ template <bool SWAP>
     if (cx.ply >= 0) {  // search has the incremental accumulator in sync
         if constexpr (SC_FX_LAZY) fx_ensure(cx, cx.ply);
         ap = &cx.stack_fx[cx.ply];
-#ifdef SC_LZSTAT
-        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
-#endif
         if (g_verify) fx_verify_now(*ap, stmp, board, cx.ply);   // incremental must equal a fresh refresh
     } else {  // outside search (bare `eval`): from-scratch fixed-point
         refresh_into_fx(cx.fx_fb, board);
@@ -2256,7 +1043,101 @@ template <bool SWAP>
     const Value v = finish_body(n, x1, b);
     return SWAP ? -v : v;
 }
-// The float eval before FXP: on x86 its fallback (dense-L1 probe, L2 != 32, HL % 64 != 0).
+#endif
+
+#if SC_FXN
+// vqtbl1q_u8 masks: the 4-byte lanes set in a 4-bit code, moved to the front in ascending order.
+constexpr auto kFxnPack = [] {
+    std::array<std::array<std::uint8_t, 16>, 16> t{};
+    for (int code = 0; code < 16; ++code) {
+        int out = 0;
+        for (int l = 0; l < 4; ++l)
+            if ((code >> l) & 1) {
+                for (int b = 0; b < 4; ++b) t[code][out * 4 + b] = static_cast<std::uint8_t>(l * 4 + b);
+                ++out;
+            }
+        for (int b = out * 4; b < 16; ++b) t[code][b] = 0xFF;
+    }
+    return t;
+}();
+
+template <bool SWAP>
+[[gnu::noinline]] Value eval_float_t(Context& cx, const Board& board) {
+    const Net& n = g_net;
+    const int hl = n.hl, half = hl / 2, L2 = n.l2, OB = n.out_buckets;
+    if (g_l1dense || L2 != 32 || (hl & 63) != 0) return eval_float_t0<SWAP>(cx, board);
+    const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
+    const AccFx* ap;
+    if (cx.ply >= 0) {  // search has the incremental accumulator in sync
+        if constexpr (SC_FX_LAZY) fx_ensure(cx, cx.ply);
+        ap = &cx.stack_fx[cx.ply];
+        if (g_verify) fx_verify_now(*ap, stmp, board, cx.ply);   // incremental must equal a fresh refresh
+    } else {  // outside search (bare `eval`): from-scratch fixed-point
+        refresh_into_fx(cx.fx_fb, board);
+        ap = &cx.fx_fb;
+    }
+    const int b = n.obucket[board.occ().count()];
+    const bool bm = !n.l1w_bm.empty();
+    const std::size_t istride = bm ? 32 : static_cast<std::size_t>(OB) * L2;
+    const float* wbase = bm ? n.l1w_bm.data() + static_cast<std::size_t>(b) * hl * 32
+                            : &n.l1w[static_cast<std::size_t>(b) * L2];
+    const float* l1bb  = &n.l1b[b * L2];
+    float32x4_t a0=vld1q_f32(l1bb),    a1=vld1q_f32(l1bb+4),  a2=vld1q_f32(l1bb+8),
+                a3=vld1q_f32(l1bb+12), a4=vld1q_f32(l1bb+16), a5=vld1q_f32(l1bb+20),
+                a6=vld1q_f32(l1bb+24), a7=vld1q_f32(l1bb+28);
+    const float32x4_t inv = vdupq_n_f32(float(1.0 / FX_S)), vz = vdupq_n_f32(0.0f), vo = vdupq_n_f32(1.0f);
+    const int32x4_t   iz  = vdupq_n_s32(0);
+    // h[0, half) comes from the first perspective, h[half, hl) from the other; SWAP exchanges them.
+    // Pack the inputs of the nonzero h[i] (ascending i, branchless), then the float ops on those only.
+    const std::int32_t* const blocks[2] = {ap->v[SWAP ? 1 - stmp : stmp], ap->v[SWAP ? stmp : 1 - stmp]};
+    alignas(16) std::int32_t px[MAX_HL + 8], py[MAX_HL + 8], nz[MAX_HL + 8];
+    int nnz = 0;
+    int32x4_t idx = {0, 1, 2, 3};
+    const int32x4_t four = vdupq_n_s32(4);
+    const uint32x4_t bit = {1u, 2u, 4u, 8u};
+    for (int blk = 0; blk < 2; ++blk) {
+        const std::int32_t* const v = blocks[blk];
+        for (int i = 0; i < half; i += 4) {
+            const int32x4_t x = vld1q_s32(v + i), y = vld1q_s32(v + i + half);
+            const unsigned code = vaddvq_u32(vandq_u32(vandq_u32(vcgtq_s32(x, iz), vcgtq_s32(y, iz)), bit));
+            const uint8x16_t sh = vld1q_u8(kFxnPack[code].data());
+            vst1q_s32(px + nnz, vreinterpretq_s32_u8(vqtbl1q_u8(vreinterpretq_u8_s32(x), sh)));
+            vst1q_s32(py + nnz, vreinterpretq_s32_u8(vqtbl1q_u8(vreinterpretq_u8_s32(y), sh)));
+            vst1q_s32(nz + nnz, vreinterpretq_s32_u8(vqtbl1q_u8(vreinterpretq_u8_s32(idx), sh)));
+            nnz += kNnzPop[code];
+            idx = vaddq_s32(idx, four);
+        }
+    }
+    for (int k = 0; k < nnz; k += 4) {
+        // crelu(a) * crelu(b) of (float)v * 2^-22 (the §L4 fill and §2.3 pairwise, lane for lane)
+        const float32x4_t p = vmulq_f32(
+            vminq_f32(vmaxq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(px + k)), inv), vz), vo),
+            vminq_f32(vmaxq_f32(vmulq_f32(vcvtq_f32_s32(vld1q_s32(py + k)), inv), vz), vo));
+        const int n4 = std::min(nnz - k, 4);
+        alignas(16) float hf[4];
+        vst1q_f32(hf, p);
+        for (int j = 0; j < n4; ++j) {
+            const float hi = hf[j];
+            const float* w = wbase + static_cast<std::size_t>(nz[k + j]) * istride;
+            a0=vfmaq_n_f32(a0, vld1q_f32(w),    hi); a1=vfmaq_n_f32(a1, vld1q_f32(w+4),  hi);
+            a2=vfmaq_n_f32(a2, vld1q_f32(w+8),  hi); a3=vfmaq_n_f32(a3, vld1q_f32(w+12), hi);
+            a4=vfmaq_n_f32(a4, vld1q_f32(w+16), hi); a5=vfmaq_n_f32(a5, vld1q_f32(w+20), hi);
+            a6=vfmaq_n_f32(a6, vld1q_f32(w+24), hi); a7=vfmaq_n_f32(a7, vld1q_f32(w+28), hi);
+        }
+    }
+    alignas(16) float x1[MAX_L2];
+    const float32x4_t acc[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    for (int q = 0; q < 8; ++q) {   // screlu: same ops per lane (clamp, square)
+        const float32x4_t c = vminq_f32(vmaxq_f32(acc[q], vz), vo);
+        vst1q_f32(x1 + 4 * q, vmulq_f32(c, c));
+    }
+    const Value val = finish_body(n, x1, b);
+    return SWAP ? -val : val;
+}
+#endif
+
+#if SC_FXP || SC_FXN
+// The float eval before FXP/FXN: its fallback (dense-L1 probe, L2 != 32, HL % 64 != 0).
 #define SC_FX_EVAL0 eval_float_t0
 #else
 #define SC_FX_EVAL0 eval_float_t
@@ -2305,9 +1186,6 @@ template <bool SWAP>
     if (cx.ply >= 0) {  // search has the incremental accumulator in sync
         if constexpr (SC_FX_LAZY) fx_ensure(cx, cx.ply);
         const AccFx& a = cx.stack_fx[cx.ply];
-#ifdef SC_LZSTAT
-        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
-#endif
         if (g_verify) {  // incremental must equal a fresh refresh, bit-exact
             AccFx chk; refresh_into_fx(chk, board);
             for (int j = 0; j < hl; ++j)
@@ -2490,12 +1368,12 @@ Value eval_quant_t(Context& cx, const Board& board) {
     const bool have_acc = (cx.ply >= 0);
     if (have_acc) {
         const int stmp = (board.sideToMove() == Color::WHITE) ? 0 : 1;
+#if SC_Q_LAZY
+        q_ensure(cx, cx.ply);
+#endif
         const Acc& a = cx.stack[cx.ply];
         acc_stm = a.v[stmp];       // read the accumulator in place — no copy
         acc_ntm = a.v[1 - stmp];
-#ifdef SC_LZSTAT
-        for (int p = cx.ply; p >= 0 && !cx.lz_needed[p]; --p) cx.lz_needed[p] = 1;
-#endif
         if (g_verify) verify_acc_now(a, stmp, board, cx.ply);   // vs a fresh recompute
     } else {
         std::int16_t* acc_buf_stm = cx.fb[0];
@@ -2521,22 +1399,12 @@ Value eval_quant_t(Context& cx, const Board& board) {
     const int off_stm = SWAP ? half : 0;
     const int off_ntm = SWAP ? 0 : half;
 #if defined(__ARM_NEON)
-    // NEON, 8 lanes/iter. Bit-identical to the scalar form: clamped products are
-    // <= QA*QA = 16129 (fit int16), and floor(p/127) == (p*16514) >> 21 exactly
-    // for p in [0,16129] (verified exhaustively). This dominated the eval body.
+    // NEON, 16 lanes/iter (P2). Bit-identical to the scalar form: clamped products are
+    // <= QA*QA = 16129 (fit u16), and floor(x/127) == (x + 1 + ((x + 1) >> 7)) >> 7 exactly for
+    // x in [0,16129] (checked for every x): vmla (1 + a*b), vsra (+ >>7), vshrn (>>7, to u8).
     static_assert(QA == 127, "NEON pairwise /QA magic assumes QA==127");
     const int16x8_t vz = vdupq_n_s16(0), vqa = vdupq_n_s16(QA);
-    const int32x4_t vM = vdupq_n_s32(16514);
-    auto pairwise8 = [&](const std::int16_t* src, std::int8_t* dst) {
-        const int16x8_t a = vminq_s16(vmaxq_s16(vld1q_s16(src), vz), vqa);
-        const int16x8_t b = vminq_s16(vmaxq_s16(vld1q_s16(src + half), vz), vqa);
-        const int16x8_t p = vmulq_s16(a, b);
-        const int32x4_t lo = vshrq_n_s32(vmulq_s32(vmovl_s16(vget_low_s16(p)), vM), 21);
-        const int32x4_t hi = vshrq_n_s32(vmulq_s32(vmovl_s16(vget_high_s16(p)), vM), 21);
-        vst1_s8(dst, vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi))));
-    };
-    if constexpr (SC_NPS_P2) {
-        (void)vM; (void)pairwise8;
+    {
         const uint16x8_t one = vdupq_n_u16(1);
         auto pw16 = [&](const std::int16_t* src, std::int8_t* dst) {
             const uint16x8_t a0 = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(src), vz), vqa));
@@ -2551,11 +1419,6 @@ Value eval_quant_t(Context& cx, const Board& board) {
             pw16(acc_stm + i, h8 + off_stm + i);
             pw16(acc_ntm + i, h8 + off_ntm + i);
         }
-    } else {
-        for (int i = 0; i < half; i += 8) {
-            pairwise8(acc_stm + i, h8 + off_stm + i);
-            pairwise8(acc_ntm + i, h8 + off_ntm + i);
-        }
     }
 #else
     auto cr = [](int x) -> int { return x < 0 ? 0 : (x > QA ? QA : x); };
@@ -2569,7 +1432,7 @@ Value eval_quant_t(Context& cx, const Board& board) {
     const std::int8_t* wbucket = n.l1w_dot.data() + static_cast<std::size_t>(b) * L2 * hl;
     float x1[MAX_L2];
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (SC_NPS_S1 && L2 == 32 && !n.l1w_sp.empty()) {
+    if (L2 == 32 && !n.l1w_sp.empty()) {
         // S1 sparse L1: list the nonzero 4-byte chunks of h8 (ascending), then for each one add its
         // 4 inputs x all 32 outputs (eight vdotq over one 128-byte weight block). Two accumulator
         // sets alternate chunks to halve the dependency chains. Zero chunks add exactly 0, and
@@ -2660,7 +1523,7 @@ Value eval_quant_t(Context& cx, const Board& board) {
         }
     }
 #elif defined(__AVX2__)
-    if (SC_NPS_S1 && L2 == 32 && (hl & 31) == 0 && !n.l1w_sp.empty()) {
+    if (L2 == 32 && (hl & 31) == 0 && !n.l1w_sp.empty()) {
         // S1 sparse L1 on AVX2: list the nonzero 4-byte chunks of h8 (8 per compare, one LUT store,
         // no branch), then per chunk broadcast its 4 inputs and add them x all 32 outputs: maddubs
         // (u8 h8 <= 127 x s8 weight; a pair sum is at most 2*127*128 = 32512, no int16 saturation)
@@ -2781,8 +1644,42 @@ Value eval_quant_t(Context& cx, const Board& board) {
 }  // namespace
 
 Value evaluate(Context& cx, const Board& board) {
-    return g_net.quant ? eval_quant_t<false>(cx, board) : eval_float_t<false>(cx, board);
+    // EVC: the raw eval is a pure function of the position, and the search can ask for the same one again
+    // (a node that returned before its TT store), as can another thread. A hit skips the eval and, on the
+    // float path while the ply's accumulator is unread, its column pass too. The search sees the same value
+    // either way. An entry: the key's top 48 bits and the eval (|eval| <= 15000, finish_body), one atomic
+    // word, so no lock and no torn read; with the index bits (at least 16) it compares the whole key.
+    const std::uint64_t key = board.hash();
+    std::uint64_t* const slot = &g_evc[key & g_evc_mask];
+    const std::uint64_t e = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    if ((e >> 16) == (key >> 16)) return static_cast<Value>(static_cast<std::int16_t>(e & 0xFFFF));
+    const Value v = g_net.quant ? eval_quant_t<false>(cx, board) : eval_float_t<false>(cx, board);
+    __atomic_store_n(slot, (key & ~std::uint64_t(0xFFFF)) | static_cast<std::uint16_t>(v), __ATOMIC_RELAXED);
+    return v;
 }
+
+void prefetch_eval(std::uint64_t key) { __builtin_prefetch(&g_evc[key & g_evc_mask], 1, 3); }
+
+void eval_cache_resize(int threads) {
+    int bits = SC_EVC_BITS;
+    while ((1 << (bits - SC_EVC_BITS)) < threads) ++bits;
+    std::uint64_t* p = nullptr;
+#if defined(_WIN32) && SC_EVC_LARGE
+    p = static_cast<std::uint64_t*>(sc_nnue_large_alloc((std::size_t(1) << bits) * sizeof(std::uint64_t)));   // zeroed
+#endif
+    if (!p) p = static_cast<std::uint64_t*>(std::calloc(std::size_t(1) << bits, sizeof(std::uint64_t)));
+    if (!p) return;   // keep the table there is
+    if (g_evc != g_evc_boot) {
+#if defined(_WIN32) && SC_EVC_LARGE
+        if (!sc_nnue_large_free(g_evc))
+#endif
+            std::free(g_evc);
+    }
+    g_evc = p;
+    g_evc_mask = (std::size_t(1) << bits) - 1;
+}
+
+void eval_cache_clear() { std::memset(g_evc, 0, (g_evc_mask + 1) * sizeof(std::uint64_t)); }
 
 Value evaluate_pass(Context& cx, const Board& board) {
     return g_net.quant ? eval_quant_t<true>(cx, board) : eval_float_t<true>(cx, board);
@@ -2793,6 +1690,7 @@ void acc_reset(Context& cx, const Board& board) {
     if (!g_net.loaded) { cx.ply = -1; return; }
     if (cx.finny_gen != g_net_gen) {   // K1: cached sums belong to the previous net
         for (auto& p : cx.finny) for (auto& f : p) for (auto& e : f) e.valid = false;
+        for (auto& e : cx.finny_fx) e.valid = false;
         cx.finny_gen = g_net_gen;
     }
     if (cx.bb.empty()) cx.bb.resize(ACC_STACK);
@@ -2800,144 +1698,53 @@ void acc_reset(Context& cx, const Board& board) {
     if (g_net.quant) {
         if (cx.stack.empty()) cx.stack.resize(ACC_STACK);
         refresh_into(cx.stack[0], board);
+#if SC_Q_LAZY
+        cx.q_ok[0] = 1;
+#endif
     } else {  // float labeler: fixed-point incremental accumulator
         if (cx.stack_fx.empty()) cx.stack_fx.resize(ACC_STACK);
-        refresh_into_fx(cx.stack_fx[0], board);
+        if (cx.finny_fx.empty()) cx.finny_fx.resize(2 * 2 * kKingBuckets);
+        if (cx.fxd_count.size() != g_net.total_inputs) cx.fxd_count.assign(g_net.total_inputs, 0);
+        // FXR: the next iteration of the same root finds its accumulator still in place (only
+        // acc_make writes the stack, and always above ply 0).
+        if (cx.fx_root_key != board.hash() || cx.fx_root_gen != g_net_gen) {
+            refresh_into_fx(cx.stack_fx[0], board);
+            cx.fx_root_key = board.hash();
+            cx.fx_root_gen = g_net_gen;
+        }
         if constexpr (SC_FX_LAZY) {
-            if (cx.fx_ok.empty()) { cx.fx_ok.resize(ACC_STACK); cx.fx_pend.resize(ACC_STACK); }
+            if (cx.fx_ok.empty()) { cx.fx_ok.resize(ACC_STACK); cx.fx_pend.reset(new Context::FxPend[ACC_STACK]); }
             cx.fx_ok[0] = 1;
         }
     }
     cx.bb[0] = BB(board);
 }
 
-// Incremental delta, templated on accumulator/weight type so the intricate delta
-// logic lives once. Quant instantiates <Acc,int8> (byte-identical to before, guarded
-// by verify_acc); the float labeler instantiates <AccFx,int32> (fixed-point).
-template <class AccT, class WT>
-void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_stk,
-                const WT* l0, void (*refresh_fn)(AccT&, const Board&)) {
-    constexpr bool FX = (sizeof(WT) != 1);  // int32 fixed-point float vs int8 quant
-    constexpr bool LZ = FX && SC_FX_LAZY;   // FXZ: the float path defers its column passes
-    cx.threats_made = 0;                     // item #9: per-move, so reset on every entry
-    if (cx.ply < 0 || cx.ply + 1 >= ACC_STACK) { cx.ply = -1; return; }
-    const int hl = g_net.hl;
-    AccT& cur = g_stk[cx.ply];
-    AccT& nxt = g_stk[cx.ply + 1];
-    // fused-apply dispatch: int8/int16 (quant) vs int32/int32 (fixed-point float).
-    auto fused = [&](auto* acc, const WT* const* add, int na, const WT* const* sub, int ns) {
-        if constexpr (FX) fused_apply_fx(acc, add, na, sub, ns, hl);
-        else              fused_apply(acc, add, na, sub, ns, hl);
-    };
-    // G4 single pass: dst = src +/- columns (quant path; the float labeler joins with FX2).
-    [[maybe_unused]] auto fused_src = [&](auto* dst, const auto* src, const WT* const* add, int na,
-                                          const WT* const* sub, int ns) {
-        if constexpr (FX) fused_apply_src_fx(dst, src, add, na, sub, ns, hl);
-        else              fused_apply_src(dst, src, add, na, sub, ns, hl);
-    };
-    const int from = m.from().index(), to = m.to().index();
-    const int moved_pi = static_cast<int>(before.at(m.from()).internal());
-    const int mcolor = moved_pi / 6, mt0 = moved_pi % 6;
-    // Refresh is only needed when the moving side's king changes BUCKET or MIRROR
-    // (e-file) side: base features are king-bucketed+mirrored, threats/pp are only
-    // mirrored, and the king is never a threat attacker/target -- so a king move
-    // that stays in the same bucket and mirror side is a plain incremental move
-    // (the normal delta path handles the king-as-piece + slider blocking exactly).
-    // Castle/promo/ep always refresh (multi-piece / index-space changes).
-    bool special;
-    bool king_rebucket = false;  // king crossed BUCKET but not mirror -> incremental + base fix
-    if (m.typeOf() != Move::NORMAL) {
-        special = true;
-    } else if (mt0 == 5) {  // king normal move
-        const int kp_f = (mcolor == 0) ? from : (from ^ 56);
-        const int kp_t = (mcolor == 0) ? to : (to ^ 56);
-        // Only a MIRROR (e-file) cross needs a full refresh: it flips the threat/pp
-        // orientation for the mover's perspective. A pure bucket cross keeps the same
-        // orientation, so it stays on the incremental path and only the mover's-own
-        // base block is rebucketed afterwards (see king_rebucket below).
-        const bool mirror_change = (file_of(kp_f) > 3) != (file_of(kp_t) > 3);
-        special = g_no_finny || mirror_change;
-        king_rebucket = !special && (king_bucket(kp_f) != king_bucket(kp_t));
-    } else {
-        special = false;
-    }
-#ifdef SC_LZSTAT
-    if (m.typeOf() == Move::CASTLING) ++g_lz_kind[0];
-    else if (m.typeOf() == Move::PROMOTION) ++g_lz_kind[1];
-    else if (m.typeOf() == Move::ENPASSANT) ++g_lz_kind[2];
-    else if (mt0 == 5) ++g_lz_kind[special ? 3 : king_rebucket ? 4 : 5];
-#endif
-    if (special) {
-        // G8: make the move on the caller's own board and unmake it after the refresh,
-        // instead of copying the Board (which deep-copies its undo stack) per refresh.
-        // Every caller passes its mutable search board; the refresh reads exactly the
-        // state a copy would have had, and unmakeMove restores the board in full.
-        Board& b = const_cast<Board&>(before);
-        b.makeMove(m);
-        refresh_fn(nxt, b);
-        cx.bb[cx.ply + 1] = BB(b);  // keep the incremental BB chain in sync
-        b.unmakeMove(m);
-        if constexpr (LZ) cx.fx_ok[cx.ply + 1] = 1;
-    } else {
-        // Single pass (x86 campaign G4, +3.7% all phases): the base columns are deferred into
-        // the threat add/sub lists and ONE src->dst fused pass per perspective reads cur and
-        // writes nxt -- no memcpy, no separate base pass. Integer sums are order-independent
-        // -> bit-identical. The probes (NOUPDATE/NOCOLS/NODIRECT) keep the two-pass form.
-        // The float labeler takes the same single pass (int32 sums -> bit-identical; self-play
-        // campaign FX2). The NODIRECT probe is int16-only, so FX ignores g_direct here.
-        const bool single_pass = (FX || g_direct) && !g_no_update && !g_no_cols;
-        if constexpr (LZ) {
-            cx.fx_ok[cx.ply + 1] = 1;               // computed unless the column pass below is deferred
-            if (!single_pass) fx_ensure(cx, cx.ply);   // the probes read cur up front
-        }
-        if (!single_pass) {
-            std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
-            std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
-        }
-        const int kabs[2] = {before.kingSq(Color::WHITE).index(), before.kingSq(Color::BLACK).index()};
-        const chess::Piece capp = before.at(m.to());
-        const bool cap = (capp != chess::Piece::NONE);
-        const int cpi = cap ? static_cast<int>(capp.internal()) : 0;
-        // ---- base delta (piece-square): one fused pass per persp, or deferred into the
-        // threat lists when single_pass (G4) ----
-        const WT* base_add[2];
-        const WT* base_sub[2][2];
-        const int nbase_sub = cap ? 2 : 1;
-        for (int p = 0; p < 2; ++p) {
-            base_add[p]    = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, to, kabs[p])) * hl;
-            base_sub[p][0] = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, from, kabs[p])) * hl;
-            if (cap) base_sub[p][1] = l0 + static_cast<std::size_t>(base_feat(p, cpi / 6, cpi % 6, to, kabs[p])) * hl;
-            if (!single_pass) fused(nxt.v[p], &base_add[p], 1, base_sub[p], nbase_sub);
-        }
-        // ---- threat + pp delta (exact: collect before/after feature sets over
-        // the affected pieces, then apply only the multiset difference) ----
-        // Incremental board bitboards: the before-state is already on the stack
-        // (cx.bb[cx.ply]), so bb0 is a reference -- no BB rebuild from board.at().
-        // Form the after-move child directly in the next slot.
-        const BB& bb0 = cx.bb[cx.ply];
-        BB& bb1 = cx.bb[cx.ply + 1];
-        if (g_verify) {  // the stack BB must equal a fresh recompute of `before`
-            BB chk(before);
-            if (bb0.occ != chk.occ || bb0.wk != chk.wk || bb0.bk != chk.bk
-                || std::memcmp(bb0.by, chk.by, sizeof(chk.by)) != 0
-                || std::memcmp(bb0.piece_on, chk.piece_on, sizeof(chk.piece_on)) != 0)
-                std::fprintf(stderr, "[nnue] BB MISMATCH ply=%d\n", cx.ply);
-        }
-        bb1 = bb0;  // copy parent state, then apply the move in place
-        const int sf_moved = (mcolor << 3) | (mt0 + 1);
-        bb1.by[sf_moved] ^= (1ull << from) | (1ull << to);
-        bb1.piece_on[from] = -1;
-        if (cap) bb1.by[((cpi / 6) << 3) | ((cpi % 6) + 1)] &= ~(1ull << to);
-        bb1.piece_on[to] = static_cast<std::int8_t>(sf_moved);
-        bb1.occ = (bb0.occ & ~(1ull << from)) | (1ull << to);
-        if (mt0 == 5) { if (mcolor == 0) bb1.wk = to; else bb1.bk = to; }  // king moved
-        if (g_no_update) { cx.ply++; return; }  // cost probe: skip the delta (BB kept)
+// The board after a normal move, from the board before it.
+inline void bb_apply(const BB& bb0, BB& bb1, int from, int to, int mcolor, int mt0, bool cap, int cpi) {
+    bb1 = bb0;  // copy parent state, then apply the move in place
+    const int sf_moved = (mcolor << 3) | (mt0 + 1);
+    bb1.by[sf_moved] ^= (1ull << from) | (1ull << to);
+    bb1.piece_on[from] = -1;
+    if (cap) bb1.by[((cpi / 6) << 3) | ((cpi % 6) + 1)] &= ~(1ull << to);
+    bb1.piece_on[to] = static_cast<std::int8_t>(sf_moved);
+    bb1.occ = (bb0.occ & ~(1ull << from)) | (1ull << to);
+    if (mt0 == 5) { if (mcolor == 0) bb1.wk = to; else bb1.bk = to; }  // king moved
+}
+
+// The columns a normal move changes, per perspective: base (with_base: they ride in the same lists as
+// the threat/pp columns, G4), threats and pawn pairs. bb0/bb1: the boards before and after the move.
+template <class WT>
+[[gnu::always_inline]] inline void delta_lists(const BB& bb0, const BB& bb1, int from, int to, int mcolor, int mt0,
+                                               bool cap, int cpi, const WT* l0, int hl, bool with_base,
+                                               const WT* (&addp)[2][1024], const WT* (&subp)[2][1024],
+                                               int (&na)[2], int (&ns)[2]) {
+    constexpr bool FX = (sizeof(WT) != 1);
+    const int sf_moved = (mcolor << 3) | (mt0 + 1);
         const int wo = orient_tbl(bb0.wk);       // white perspective (swap 0)
         const int bo = orient_tbl(bb0.bk) ^ 56;  // black perspective (swap 8)
 
-        const std::uint64_t kings = bb0.by[6] | bb0.by[14];  // king move is `special`, so kings0==kings1
         const std::uint64_t excl = (1ull << from) | (1ull << to);
-      if (g_direct || FX) {  // float always uses the direct path (no int16-only fallback)
         // ===== Direct delta: emit only genuinely-changed columns straight to the
         // fused add/sub lists -- no full-set collect, no sort, no merge-diff.
         // Moved/captured/non-slider threat indices never cancel between before and
@@ -2945,46 +1752,46 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
         // emitted directly; each slider emits its exact a0^a1 ray change (plus the
         // from/to identity flip). Every emitted column is a real change.
         const std::size_t bd = g_net.base_dims;
-        const WT* (&addp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.addp);
-        const WT* (&subp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.subp);
-        int na[2] = {0, 0}, ns[2] = {0, 0};
         // P1: every line of a column, issued when the column is known.
         [[maybe_unused]] auto prefetch_col = [&](const WT* col) {
             const char* c = reinterpret_cast<const char*>(col);
             const std::size_t bytes = static_cast<std::size_t>(hl) * sizeof(WT);
+            if constexpr (FX) {
+                for (std::size_t off = 0; off < bytes && SC_FX_PF_STRIDE; off += SC_FX_PF_STRIDE + !SC_FX_PF_STRIDE) __builtin_prefetch(c + off, 0, SC_NPS_PF_LOC);
+                return;
+            }
             for (std::size_t off = 0; off < bytes; off += kPfStride) __builtin_prefetch(c + off, 0, SC_NPS_PF_LOC);
         };
-        if (single_pass)   // G4: the base columns ride in the same lists as the threat/pp columns
+        if (with_base) {   // G4
+            const int kabs[2] = {bb0.wk, bb0.bk};
             for (int p = 0; p < 2; ++p) {
-                addp[p][na[p]++] = base_add[p];
-                subp[p][ns[p]++] = base_sub[p][0];
-                if (cap) subp[p][ns[p]++] = base_sub[p][1];
-                if constexpr (SC_NPS_P1) {
-                    prefetch_col(base_add[p]); prefetch_col(base_sub[p][0]);
-                    if (cap) prefetch_col(base_sub[p][1]);
+                const WT* const ba = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, to, kabs[p])) * hl;
+                const WT* const b0 = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, from, kabs[p])) * hl;
+                addp[p][na[p]++] = ba;
+                subp[p][ns[p]++] = b0;
+                if constexpr (SC_NPS_P1 || (FX && SC_FX_PF_X86)) { prefetch_col(ba); prefetch_col(b0); }
+                if (cap) {
+                    const WT* const b1 = l0 + static_cast<std::size_t>(base_feat(p, cpi / 6, cpi % 6, to, kabs[p])) * hl;
+                    subp[p][ns[p]++] = b1;
+                    if constexpr (SC_NPS_P1 || (FX && SC_FX_PF_X86)) prefetch_col(b1);
                 }
             }
+        }
         auto push = [&](int p, std::uint32_t idx, bool add) {
             const WT* col = l0 + (bd + idx) * hl;
-            if constexpr (SC_NPS_P1) prefetch_col(col);
+            if constexpr (SC_NPS_P1 || (FX && SC_FX_PF_X86)) prefetch_col(col);
             if (add) addp[p][na[p]++] = col; else subp[p][ns[p]++] = col;
         };
         auto emit_threat = [&](int a_sf, int a_sq, int t_sq, int attacked, bool add) {
-            // Item #9: count only threats the MOVER gains on a higher-valued victim. piece-type bits
-            // (1=pawn..5=queen) are ordered by value, so the comparison needs no table; the colour
-            // bit (8) selects the mover's own attackers, so a threat created AGAINST the mover does
-            // not inflate the count. Only pairs that are threat features count (attacks on a king
-            // and the other excluded pairs map past THREAT_DIMS).
+            // Only pairs that are threat features are pushed (attacks on a king and the other
+            // excluded pairs map past THREAT_DIMS).
             const std::uint32_t s = make_threat_index(a_sf, a_sq ^ wo, t_sq ^ wo, attacked);
-            if (s < (std::uint32_t)THREAT_DIMS) {
-                if (add && (a_sf & 8) == (sf_moved & 8) && (attacked & 7) > (a_sf & 7)) ++cx.threats_made;
-                push(0, s, add);
-            }
+            if (s < (std::uint32_t)THREAT_DIMS) push(0, s, add);
             const std::uint32_t nn = make_threat_index(a_sf ^ 8, a_sq ^ bo, t_sq ^ bo, attacked ^ 8);
             if (nn < (std::uint32_t)THREAT_DIMS) push(1, nn, add);
         };
         // full threat set of piece `sf` on `sq` in board `b` (mover: sub@bb0, add@bb1;
-        // captured: sub@bb0). Masks match collect_piece_threats exactly.
+        // captured: sub@bb0).
         auto emit_full = [&](const BB& b, int sq, int sf, bool add) {
             const int pt = sf & 7;
             if (pt == 6 || pt == 0) return;
@@ -3077,7 +1884,349 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
         }
         if (cap && (cpi % 6) == 0)
             emit_pp(bb0, to, cpi / 6, false, mt0 == 0 ? from : -1);
+}
 
+// FXZ: a pending normal move's board and column lists, made at the first read of its ply.
+void fx_enumerate(Context& cx, int k) {
+    Context::FxPend& e = cx.fx_pend[k];
+    const BB& bb0 = cx.bb[k - 1];
+    BB& bb1 = cx.bb[k];
+    bb_apply(bb0, bb1, e.from, e.to, e.mcolor, e.mt0, e.cap, e.cpi);
+    e.na[0] = e.na[1] = e.ns[0] = e.ns[1] = 0;
+    delta_lists<std::int32_t>(bb0, bb1, e.from, e.to, e.mcolor, e.mt0, e.cap, e.cpi, g_net.l0w_fx_p, g_net.hl, true,
+                              fx_adds(cx, e), fx_subs(cx, e), e.na, e.ns);
+}
+
+// FXZ: at the first read of a ply whose king crossed a bucket (same mirror), bring the mover's own base
+// block over in the same single pass: with enough men, the two buckets' K1 sums (up to date with only
+// the changed pieces) join the column lists; with few, each man's old and new column (2 per man is
+// already cheaper than two cache passes there). int32 sums: the same integers either way.
+void fx_rebucket(Context& cx, Context::FxPend& e, const BB& bb1) {
+    const std::int32_t* const l0 = g_net.l0w_fx_p;
+    const int hl = g_net.hl;
+    const int mcolor = e.rb_color, from = e.from, to = e.to;
+    if (__builtin_popcountll(bb1.occ) >= SC_FX_K1_MIN) {
+        const int flip = (file_of(mcolor == 0 ? to : (to ^ 56)) > 3) ? 1 : 0;
+        const int kb_old = king_bucket(mcolor == 0 ? from : (from ^ 56));
+        const int kb_new = king_bucket(mcolor == 0 ? to : (to ^ 56));
+        auto bring_up = [&](Context::FinnyFx& c, int ksq) {
+            const std::int32_t** ra = reinterpret_cast<const std::int32_t**>(cx.ra);
+            const std::int32_t** rs = reinterpret_cast<const std::int32_t**>(cx.rs);
+            int nra = 0, nrs = 0;
+            if (!c.valid) {
+                std::memset(c.acc, 0, sizeof(c.acc));
+                std::memset(c.by, 0, sizeof(c.by));
+                c.valid = true;
+            }
+            for (int sf = 1; sf < 15; ++sf) {
+                if ((sf & 7) == 0 || (sf & 7) == 7) continue;
+                std::uint64_t gone = c.by[sf] & ~bb1.by[sf], added = bb1.by[sf] & ~c.by[sf];
+                const int col = sf >> 3, t0 = (sf & 7) - 1;
+                while (gone)  { const int sq = __builtin_ctzll(gone);  gone &= gone - 1;
+                    rs[nrs++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, ksq) * hl; }
+                while (added) { const int sq = __builtin_ctzll(added); added &= added - 1;
+                    ra[nra++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, ksq) * hl; }
+                c.by[sf] = bb1.by[sf];
+                if (nra > 32 || nrs > 32) {   // flush (the scratch holds 40)
+                    fused_apply_fx(c.acc, ra, nra, rs, nrs, hl);
+                    nra = nrs = 0;
+                }
+            }
+            if (nra + nrs) fused_apply_fx(c.acc, ra, nra, rs, nrs, hl);
+        };
+        Context::FinnyFx* const tab = cx.finny_fx.data() + (mcolor * 2 + flip) * kKingBuckets;
+        bring_up(tab[kb_old], from);
+        bring_up(tab[kb_new], to);
+        fx_adds(cx, e)[mcolor][e.na[mcolor]++] = tab[kb_new].acc;
+        fx_subs(cx, e)[mcolor][e.ns[mcolor]++] = tab[kb_old].acc;
+    } else {
+        std::uint64_t occ = bb1.occ;
+        while (occ) {
+            const int sq = __builtin_ctzll(occ); occ &= occ - 1;
+            const int sf = bb1.piece_on[sq];
+            const int col = sf >> 3, t0 = (sf & 7) - 1;
+            fx_subs(cx, e)[mcolor][e.ns[mcolor]++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, from) * hl;  // old bucket
+            fx_adds(cx, e)[mcolor][e.na[mcolor]++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, to)   * hl;  // new bucket
+        }
+    }
+}
+
+#if SC_Q_LAZY
+// A pending int8 ply at its first read: the board, the lists and one src->dst pass per perspective; a king across a
+// bucket (same mirror) then brings the mover's own base block over, as the eager path below does.
+void q_apply(Context& cx, int k) {
+    const Context::QPend& e = cx.q_pend[k];
+    const int hl = g_net.hl;
+    Acc& cur = cx.stack[k - 1];
+    Acc& nxt = cx.stack[k];
+    if (e.kind == 1) {
+        std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(std::int16_t));
+        std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(std::int16_t));
+        cx.bb[k] = cx.bb[k - 1];
+        return;
+    }
+    using WT = std::int8_t;
+    const WT* const l0 = g_net.l0w_i8.data();
+    const int from = e.from, to = e.to, mcolor = e.mcolor;
+    const BB& bb0 = cx.bb[k - 1];
+    BB& bb1 = cx.bb[k];
+    bb_apply(bb0, bb1, from, to, mcolor, e.mt0, e.cap, e.cpi);
+    const WT* (&addp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.addp);
+    const WT* (&subp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.subp);
+    int na[2] = {0, 0}, ns[2] = {0, 0};
+    delta_lists<WT>(bb0, bb1, from, to, mcolor, e.mt0, e.cap, e.cpi, l0, hl, true, addp, subp, na, ns);
+    fused_apply_src(nxt.v[0], cur.v[0], addp[0], na[0], subp[0], ns[0], hl);
+    fused_apply_src(nxt.v[1], cur.v[1], addp[1], na[1], subp[1], ns[1], hl);
+    if (!e.rb) return;
+    if (__builtin_popcountll(bb1.occ) >= SC_NPS_K1_MIN) {
+        const int flip = (file_of(mcolor == 0 ? to : (to ^ 56)) > 3) ? 1 : 0;
+        const int kb_old = king_bucket(mcolor == 0 ? from : (from ^ 56));
+        const int kb_new = king_bucket(mcolor == 0 ? to : (to ^ 56));
+        auto refresh_finny = [&](Context::Finny& c, int ksq) {
+            const WT** ra = reinterpret_cast<const WT**>(cx.ra);
+            const WT** rs = reinterpret_cast<const WT**>(cx.rs);
+            int nra = 0, nrs = 0;
+            if (!c.valid) {
+                std::memset(c.acc, 0, sizeof(c.acc));
+                std::memset(c.by, 0, sizeof(c.by));
+                c.valid = true;
+            }
+            for (int sf = 1; sf < 15; ++sf) {
+                if ((sf & 7) == 0 || (sf & 7) == 7) continue;
+                std::uint64_t gone = c.by[sf] & ~bb1.by[sf], added = bb1.by[sf] & ~c.by[sf];
+                const int col = sf >> 3, t0 = (sf & 7) - 1;
+                while (gone)  { const int sq = __builtin_ctzll(gone);  gone &= gone - 1;
+                    rs[nrs++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, ksq) * hl; }
+                while (added) { const int sq = __builtin_ctzll(added); added &= added - 1;
+                    ra[nra++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, ksq) * hl; }
+                c.by[sf] = bb1.by[sf];
+                if (nra > 32 || nrs > 32) {   // flush (the scratch holds 40)
+                    fused_apply(c.acc, ra, nra, rs, nrs, hl);
+                    nra = nrs = 0;
+                }
+            }
+            if (nra + nrs) fused_apply(c.acc, ra, nra, rs, nrs, hl);
+        };
+        Context::Finny& eo = cx.finny[mcolor][flip][kb_old];
+        Context::Finny& en = cx.finny[mcolor][flip][kb_new];
+        refresh_finny(eo, from);
+        refresh_finny(en, to);
+        std::int16_t* a = nxt.v[mcolor];
+        for (int j = 0; j < hl; ++j)
+            a[j] = static_cast<std::int16_t>(a[j] - eo.acc[j] + en.acc[j]);
+    } else {
+        const WT** ra = reinterpret_cast<const WT**>(cx.ra);
+        const WT** rs = reinterpret_cast<const WT**>(cx.rs);
+        int nra = 0, nrs = 0;
+        std::uint64_t occ = bb1.occ;
+        while (occ) {
+            const int sq = __builtin_ctzll(occ); occ &= occ - 1;
+            const int sf = bb1.piece_on[sq];
+            const int col = sf >> 3, t0 = (sf & 7) - 1;
+            rs[nrs++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, from) * hl;  // old bucket (king@from)
+            ra[nra++] = l0 + (std::size_t)base_feat(mcolor, col, t0, sq, to)   * hl;  // new bucket (king@to)
+        }
+        fused_apply(nxt.v[mcolor], ra, nra, rs, nrs, hl);
+    }
+}
+#endif
+
+// Incremental delta, templated on accumulator/weight type so the intricate delta
+// logic lives once. Quant instantiates <Acc,int8> (byte-identical to before, guarded
+// by verify_acc); the float labeler instantiates <AccFx,int32> (fixed-point).
+template <class AccT, class WT>
+void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_stk,
+                const WT* l0, void (*refresh_fn)(AccT&, const Board&)) {
+    constexpr bool FX = (sizeof(WT) != 1);  // int32 fixed-point float vs int8 quant
+    constexpr bool LZ = FX && SC_FX_LAZY;   // FXZ: the float path defers its board, lists and column passes
+    if (cx.ply < 0 || cx.ply + 1 >= ACC_STACK) { cx.ply = -1; return; }
+    const int hl = g_net.hl;
+    AccT& cur = g_stk[cx.ply];
+    AccT& nxt = g_stk[cx.ply + 1];
+    // fused-apply dispatch: int8/int16 (quant) vs int32/int32 (fixed-point float).
+    auto fused = [&](auto* acc, const WT* const* add, int na, const WT* const* sub, int ns) {
+        if constexpr (FX) fused_apply_fx(acc, add, na, sub, ns, hl);
+        else              fused_apply(acc, add, na, sub, ns, hl);
+    };
+    // G4 single pass: dst = src +/- columns (quant path; the float labeler joins with FX2).
+    [[maybe_unused]] auto fused_src = [&](auto* dst, const auto* src, const WT* const* add, int na,
+                                          const WT* const* sub, int ns) {
+        if constexpr (FX) fused_apply_src_fx(dst, src, add, na, sub, ns, hl);
+        else              fused_apply_src(dst, src, add, na, sub, ns, hl);
+    };
+    const int from = m.from().index(), to = m.to().index();
+    const int moved_pi = static_cast<int>(before.at(m.from()).internal());
+    const int mcolor = moved_pi / 6, mt0 = moved_pi % 6;
+    // Refresh is only needed when the moving side's king changes BUCKET or MIRROR
+    // (e-file) side: base features are king-bucketed+mirrored, threats/pp are only
+    // mirrored, and the king is never a threat attacker/target -- so a king move
+    // that stays in the same bucket and mirror side is a plain incremental move
+    // (the normal delta path handles the king-as-piece + slider blocking exactly).
+    // Castle/promo/ep always refresh (multi-piece / index-space changes).
+    bool special;
+    bool king_rebucket = false;  // king crossed BUCKET but not mirror -> incremental + base fix
+    if (m.typeOf() != Move::NORMAL) {
+        special = true;
+    } else if (mt0 == 5) {  // king normal move
+        const int kp_f = (mcolor == 0) ? from : (from ^ 56);
+        const int kp_t = (mcolor == 0) ? to : (to ^ 56);
+        // Only a MIRROR (e-file) cross needs a full refresh: it flips the threat/pp
+        // orientation for the mover's perspective. A pure bucket cross keeps the same
+        // orientation, so it stays on the incremental path and only the mover's-own
+        // base block is rebucketed afterwards (see king_rebucket below).
+        const bool mirror_change = (file_of(kp_f) > 3) != (file_of(kp_t) > 3);
+        special = g_no_finny || mirror_change;
+        king_rebucket = !special && (king_bucket(kp_f) != king_bucket(kp_t));
+    } else {
+        special = false;
+    }
+    if (special) {
+        // G8: make the move on the caller's own board and unmake it after the refresh,
+        // instead of copying the Board (which deep-copies its undo stack) per refresh.
+        // Every caller passes its mutable search board; the refresh reads exactly the
+        // state a copy would have had, and unmakeMove restores the board in full.
+        Board& b = const_cast<Board&>(before);
+        if constexpr (FX) {
+            // FXD: a castling, promotion, en-passant or mirror-crossing king move changes few of the
+            // ~100 active columns of a perspective, except the mirror-crossing one's own. Diff the two
+            // feature multisets and apply only the difference (int32 sums: the same integers as a
+            // refresh); a perspective that changes more than it keeps is summed from the bias.
+            if constexpr (LZ) fx_ensure(cx, cx.ply);
+            const std::size_t bd = g_net.base_dims;
+            int nf[2][2] = {{0, 0}, {0, 0}};
+            auto collect = [&](const Board& bd_board, int w) {
+                const int s = (bd_board.sideToMove() == Color::WHITE) ? 0 : 1;
+                gather(bd_board, bd,
+                       [&](std::size_t f) { cx.fxd[w][s][nf[w][s]++] = static_cast<std::uint32_t>(f); },
+                       [&](std::size_t f) { cx.fxd[w][1 - s][nf[w][1 - s]++] = static_cast<std::uint32_t>(f); });
+            };
+            collect(before, 0);
+            b.makeMove(m);
+            collect(b, 1);
+            cx.bb[cx.ply + 1] = BB(b);  // keep the incremental BB chain in sync
+            b.unmakeMove(m);
+            const WT* (&addp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.addp);
+            const WT* (&subp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.subp);
+            for (int p = 0; p < 2; ++p) {
+                const std::uint32_t* const f0 = cx.fxd[0][p];
+                const std::uint32_t* const f1 = cx.fxd[1][p];
+                std::uint8_t* const cnt = cx.fxd_count.data();   // zero between uses
+                int na = 0, ns = 0;
+                for (int k = 0; k < nf[0][p]; ++k) ++cnt[f0[k]];
+                for (int k = 0; k < nf[1][p]; ++k) {
+                    if (cnt[f1[k]]) --cnt[f1[k]];
+                    else addp[p][na++] = l0 + static_cast<std::size_t>(f1[k]) * hl;
+                }
+                for (int k = 0; k < nf[0][p]; ++k)
+                    if (cnt[f0[k]]) { --cnt[f0[k]]; subp[p][ns++] = l0 + static_cast<std::size_t>(f0[k]) * hl; }
+                if (na + ns < nf[1][p]) {
+                    fused_src(nxt.v[p], cur.v[p], addp[p], na, subp[p], ns);
+                } else {
+                    for (int k = 0; k < nf[1][p]; ++k) addp[p][k] = l0 + static_cast<std::size_t>(f1[k]) * hl;
+                    fused_src(nxt.v[p], g_net.l0b_fx.data(), addp[p], nf[1][p], subp[p], 0);
+                }
+            }
+        } else {
+            b.makeMove(m);
+            refresh_fn(nxt, b);
+            cx.bb[cx.ply + 1] = BB(b);  // keep the incremental BB chain in sync
+            b.unmakeMove(m);
+#if SC_Q_LAZY
+            cx.q_ok[cx.ply + 1] = 1;   // a refresh does not read the parent, which can stay pending
+#endif
+        }
+        if constexpr (LZ) cx.fx_ok[cx.ply + 1] = 1;
+    } else {
+        // Single pass (x86 campaign G4, +3.7% all phases): the base columns are deferred into
+        // the threat add/sub lists and ONE src->dst fused pass per perspective reads cur and
+        // writes nxt -- no memcpy, no separate base pass. Integer sums are order-independent
+        // -> bit-identical. The probes (NOUPDATE/NOCOLS) keep the two-pass form.
+        // The float labeler takes the same single pass (int32 sums -> bit-identical; self-play
+        // campaign FX2).
+        const bool single_pass = !g_no_update && !g_no_cols;
+#if SC_Q_LAZY
+        if constexpr (!FX) {
+            if (single_pass) {   // record the move and stop; see q_apply
+                Context::QPend& e = cx.q_pend[cx.ply + 1];
+                const chess::Piece cp = before.at(m.to());
+                const bool c = (cp != chess::Piece::NONE);
+                e.kind = 0;
+                e.from = static_cast<std::int8_t>(from);
+                e.to = static_cast<std::int8_t>(to);
+                e.mcolor = static_cast<std::int8_t>(mcolor);
+                e.mt0 = static_cast<std::int8_t>(mt0);
+                e.cap = c;
+                e.cpi = c ? static_cast<std::int8_t>(cp.internal()) : std::int8_t(0);
+                e.rb = king_rebucket;
+                cx.q_ok[cx.ply + 1] = 0;
+                cx.ply++;
+                return;
+            }
+            cx.q_ok[cx.ply + 1] = 1;
+            q_ensure(cx, cx.ply);   // the probes read cur up front
+        }
+#endif
+        if constexpr (LZ) {
+            if (single_pass) {
+                // FXZ: record the move and stop. Its board, its column lists and the passes all wait for
+                // the first read of this ply; a ply popped unread costs nothing more.
+                Context::FxPend& e = cx.fx_pend[cx.ply + 1];
+                const chess::Piece cp = before.at(m.to());
+                e.kind = 0;
+                e.from = from;
+                e.to = to;
+                e.mcolor = mcolor;
+                e.mt0 = mt0;
+                e.cap = (cp != chess::Piece::NONE);
+                e.cpi = e.cap ? static_cast<int>(cp.internal()) : 0;
+                e.rb_color = king_rebucket ? mcolor : -1;
+                cx.fx_ok[cx.ply + 1] = 0;
+                cx.ply++;
+                return;
+            }
+            cx.fx_ok[cx.ply + 1] = 1;
+            fx_ensure(cx, cx.ply);   // the probes read cur up front
+        }
+        if (!single_pass) {
+            std::memcpy(nxt.v[0], cur.v[0], hl * sizeof(nxt.v[0][0]));
+            std::memcpy(nxt.v[1], cur.v[1], hl * sizeof(nxt.v[0][0]));
+        }
+        const int kabs[2] = {before.kingSq(Color::WHITE).index(), before.kingSq(Color::BLACK).index()};
+        const chess::Piece capp = before.at(m.to());
+        const bool cap = (capp != chess::Piece::NONE);
+        const int cpi = cap ? static_cast<int>(capp.internal()) : 0;
+        // ---- base delta (piece-square): one fused pass per persp, or deferred into the
+        // threat lists when single_pass (G4) ----
+        const WT* base_add[2];
+        const WT* base_sub[2][2];
+        const int nbase_sub = cap ? 2 : 1;
+        for (int p = 0; p < 2; ++p) {
+            base_add[p]    = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, to, kabs[p])) * hl;
+            base_sub[p][0] = l0 + static_cast<std::size_t>(base_feat(p, mcolor, mt0, from, kabs[p])) * hl;
+            if (cap) base_sub[p][1] = l0 + static_cast<std::size_t>(base_feat(p, cpi / 6, cpi % 6, to, kabs[p])) * hl;
+            if (!single_pass) fused(nxt.v[p], &base_add[p], 1, base_sub[p], nbase_sub);
+        }
+        // ---- threat + pp delta (exact: collect before/after feature sets over
+        // the affected pieces, then apply only the multiset difference) ----
+        // Incremental board bitboards: the before-state is already on the stack
+        // (cx.bb[cx.ply]), so bb0 is a reference -- no BB rebuild from board.at().
+        // Form the after-move child directly in the next slot.
+        const BB& bb0 = cx.bb[cx.ply];
+        BB& bb1 = cx.bb[cx.ply + 1];
+        if (g_verify) {  // the stack BB must equal a fresh recompute of `before`
+            BB chk(before);
+            if (bb0.occ != chk.occ || bb0.wk != chk.wk || bb0.bk != chk.bk
+                || std::memcmp(bb0.by, chk.by, sizeof(chk.by)) != 0
+                || std::memcmp(bb0.piece_on, chk.piece_on, sizeof(chk.piece_on)) != 0)
+                std::fprintf(stderr, "[nnue] BB MISMATCH ply=%d\n", cx.ply);
+        }
+        bb_apply(bb0, bb1, from, to, mcolor, mt0, cap, cpi);
+        if (g_no_update) { cx.ply++; return; }  // cost probe: skip the delta (BB kept)
+      {   // direct delta
+        const WT* (&addp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.addp);
+        const WT* (&subp)[2][1024] = *reinterpret_cast<const WT* (*)[2][1024]>(&cx.subp);
+        int na[2] = {0, 0}, ns[2] = {0, 0};
+        delta_lists<WT>(bb0, bb1, from, to, mcolor, mt0, cap, cpi, l0, hl, single_pass, addp, subp, na, ns);
         if (g_prefetch && !SC_NPS_P1)
             for (int p = 0; p < 2; ++p) {
                 for (int k = 0; k < na[p]; ++k)
@@ -3088,25 +2237,7 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
                         __builtin_prefetch(reinterpret_cast<const char*>(subp[p][k]) + t * kPfStride, 0, SC_NPS_PF_LOC);
             }
         if (!g_no_cols) {  // NOCOLS probe: keep enumeration, skip the column adds
-            bool deferred = false;
-            if constexpr (LZ) {   // FXZ: record the lists; a rebucket pass needs nxt now
-                if (single_pass && !king_rebucket && na[0] + ns[0] <= kFxPendCap && na[1] + ns[1] <= kFxPendCap) {
-                    Context::FxPend& e = cx.fx_pend[cx.ply + 1];
-                    for (int p = 0; p < 2; ++p) {
-                        e.na[p] = na[p];
-                        e.ns[p] = ns[p];
-                        std::memcpy(e.col[p], addp[p], static_cast<std::size_t>(na[p]) * sizeof(e.col[p][0]));
-                        std::memcpy(e.col[p] + na[p], subp[p], static_cast<std::size_t>(ns[p]) * sizeof(e.col[p][0]));
-                    }
-                    cx.fx_ok[cx.ply + 1] = 0;
-                    deferred = true;
-                } else if (single_pass) {
-                    fx_ensure(cx, cx.ply);
-                }
-            }
-            if (deferred) {
-                // FXZ: applied on the first read of this ply (fx_ensure)
-            } else if (single_pass) {   // G4: cur -> nxt in one pass (base + threat + pp columns)
+            if (single_pass) {   // G4: cur -> nxt in one pass (base + threat + pp columns)
                 fused_src(nxt.v[0], cur.v[0], addp[0], na[0], subp[0], ns[0]);
                 fused_src(nxt.v[1], cur.v[1], addp[1], na[1], subp[1], ns[1]);
             } else {
@@ -3114,55 +2245,6 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
                 fused(nxt.v[1], addp[1], na[1], subp[1], ns[1]);
             }
         }
-      } else if constexpr (!FX) {  // int16-only collect+diff fallback (SCNNUE_NODIRECT)
-        static thread_local FeatList bef, aft;
-        bef.clear();
-        aft.clear();
-        // BEF: moved piece (full) + captured piece (full) + attackers of from/to
-        // (sliders full for ray effects, knights/pawns reduced to the from/to target).
-        collect_piece_threats(bef, bb0, from, bb0.piece_on[from], wo, bo);
-        if (cap) collect_piece_threats(bef, bb0, to, bb0.piece_on[to], wo, bo);
-        {
-            const std::uint64_t att = (attackers_of(bb0, from) | attackers_of(bb0, to)) & ~excl;
-            const std::uint64_t sl = bb0.by[3] | bb0.by[11] | bb0.by[4] | bb0.by[12] | bb0.by[5] | bb0.by[13];
-            std::uint64_t full = att & sl;
-            while (full) { const int s = __builtin_ctzll(full); full &= full - 1;
-                collect_piece_threats(bef, bb0, s, bb0.piece_on[s], wo, bo); }
-            std::uint64_t ns = att & ~sl & ~kings;
-            while (ns) { const int s = __builtin_ctzll(ns); ns &= ns - 1;
-                collect_ns_threat(bef, bb0, s, bb0.piece_on[s], from, wo, bo);
-                collect_ns_threat(bef, bb0, s, bb0.piece_on[s], to, wo, bo); }
-        }
-        // AFT: moved piece now at `to` (full) + attackers on bb1 (same split).
-        collect_piece_threats(aft, bb1, to, bb1.piece_on[to], wo, bo);
-        {
-            const std::uint64_t att = (attackers_of(bb1, from) | attackers_of(bb1, to)) & ~excl;
-            const std::uint64_t sl = bb1.by[3] | bb1.by[11] | bb1.by[4] | bb1.by[12] | bb1.by[5] | bb1.by[13];
-            std::uint64_t full = att & sl;
-            while (full) { const int s = __builtin_ctzll(full); full &= full - 1;
-                collect_piece_threats(aft, bb1, s, bb1.piece_on[s], wo, bo); }
-            std::uint64_t ns = att & ~sl & ~kings;
-            while (ns) { const int s = __builtin_ctzll(ns); ns &= ns - 1;
-                collect_ns_threat(aft, bb1, s, bb1.piece_on[s], from, wo, bo);
-                collect_ns_threat(aft, bb1, s, bb1.piece_on[s], to, wo, bo); }
-        }
-        if (mt0 == 0) {  // moved pawn: its pairs move
-            collect_pp_for_pawn(bef, bb0, from, mcolor, wo, bo);
-            collect_pp_for_pawn(aft, bb1, to, mcolor, wo, bo);
-        }
-        if (cap && (cpi % 6) == 0)  // captured pawn: its pairs vanish
-            collect_pp_for_pawn(bef, bb0, to, cpi / 6, wo, bo);
-        if (g_prefetch) {
-            const std::size_t bd = g_net.base_dims;
-            for (int p = 0; p < 2; ++p) {
-                for (int k = 0; k < bef.n[p]; ++k)
-                    __builtin_prefetch(l0 + (bd + bef.v[p][k]) * hl);
-                for (int k = 0; k < aft.n[p]; ++k)
-                    __builtin_prefetch(l0 + (bd + aft.v[p][k]) * hl);
-            }
-        }
-        apply_diff(nxt.v[0], bef.v[0], bef.n[0], aft.v[0], aft.n[0]);
-        apply_diff(nxt.v[1], bef.v[1], bef.n[1], aft.v[1], aft.n[1]);
       }
         // King crossed a bucket (same mirror): the mover's-own perspective still has
         // every piece indexed under the OLD king bucket. Rebucket v[mcolor] in place
@@ -3173,7 +2255,7 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
           bool rebucketed = false;
           // With few men the direct form (2 columns per man) is already cheaper than two cache
           // passes; the caches pay where the board is full.
-          if constexpr (!FX && SC_NPS_K1) if (__builtin_popcountll(bb1.occ) >= SC_NPS_K1_MIN) {
+          if constexpr (!FX) if (__builtin_popcountll(bb1.occ) >= SC_NPS_K1_MIN) {
             rebucketed = true;
             // Bring the old and the new bucket's cache to the current pieces, then swap them in.
             const int flip = (file_of(mcolor == 0 ? to : (to ^ 56)) > 3) ? 1 : 0;
@@ -3233,9 +2315,6 @@ void acc_make_t(Context& cx, const Board& before, Move m, std::vector<AccT>& g_s
 
 // Dispatch acc_make to the active accumulator (quant int16 / float fixed-point int32).
 void acc_make(Context& cx, const Board& before, Move m) {
-#ifdef SC_LZSTAT
-    struct Mark { Context& c; ~Mark() { if (c.ply > 0) { c.lz_needed[c.ply] = 0; ++g_lz_upd; } } } mark{cx};
-#endif
     if (g_net.quant)
         acc_make_t<Acc, std::int8_t>(cx, before, m, cx.stack, g_net.l0w_i8.data(), refresh_into);
     else
@@ -3243,72 +2322,40 @@ void acc_make(Context& cx, const Board& before, Move m) {
 }
 
 void acc_unmake(Context& cx) {
-#ifdef SC_LZSTAT
-    if (cx.ply > 0 && !cx.lz_needed[cx.ply]) ++g_lz_skip;
-#endif
     if (cx.ply > 0) cx.ply--;
 }
 
 void acc_clear(Context& cx) { cx.ply = -1; }
 
-// Accumulator units read by acc_delta_l1: a CONTIGUOUS PREFIX of each perspective, not all of them.
-// The full 1024-unit norm measured -3.395% nps with the tree held identical
-// (logs/accsig/cost-pure.json), which a term firing on a quarter of quiet moves cannot pay for. The
-// plug only needs to rank a move against a quartile threshold, not to know the norm exactly, and the
-// hidden units carry no ordering, so a fixed prefix is as good a sample as any.
-//
-// It must be a PREFIX and not a stride: SC_ACCSIG_STRIDE=4 measured -5.763%, WORSE than reading
-// everything, because the contiguous loop auto-vectorises to 16-wide SIMD and a strided one does not
-// -- 64 vector operations become 256 scalar ones with strided loads (logs/accsig/cost-pure4.json).
-#ifndef SC_ACCSIG_UNITS
-#define SC_ACCSIG_UNITS 128
-#endif
-
-int acc_threats_made(const Context& cx) noexcept { return g_net.quant ? cx.threats_made : 0; }
-
-int acc_delta_l1(const Context& cx) noexcept {
-    // Item #8 (novelty ledger): the magnitude of the feature-column change a move makes.
-    // A quiet move swaps two columns per perspective, so this is ||W[to] - W[from]||_1 read
-    // off the accumulator stack rather than recomputed -- the values are already resident,
-    // which is what makes the signal cheap. Both perspectives are summed because the mover's
-    // piece changes square in both halves' feature sets.
-    if (cx.ply < 1 || !g_net.quant) return 0;
-    const int hl = g_net.hl;
-    const std::int16_t* c0 = cx.stack[cx.ply].v[0];
-    const std::int16_t* p0 = cx.stack[cx.ply - 1].v[0];
-    const std::int16_t* c1 = cx.stack[cx.ply].v[1];
-    const std::int16_t* p1 = cx.stack[cx.ply - 1].v[1];
-    const int n = hl < SC_ACCSIG_UNITS ? hl : SC_ACCSIG_UNITS;
-    int sum = 0;
-    for (int j = 0; j < n; ++j)
-        sum += std::abs(int(c0[j]) - int(p0[j])) + std::abs(int(c1[j]) - int(p1[j]));
-    return sum;
-}
 
 void acc_make_null(Context& cx) {
     if (cx.ply < 0 || cx.ply + 1 >= ACC_STACK) { cx.ply = -1; return; }
     const int hl = g_net.hl;
     if (g_net.quant) {
+#if SC_Q_LAZY
+        cx.q_pend[cx.ply + 1].kind = 1;   // the copy and the board wait for the first read
+        cx.q_ok[cx.ply + 1] = 0;
+        cx.ply++;
+        return;
+#endif
         std::memcpy(cx.stack[cx.ply + 1].v[0], cx.stack[cx.ply].v[0], hl * sizeof(std::int16_t));
         std::memcpy(cx.stack[cx.ply + 1].v[1], cx.stack[cx.ply].v[1], hl * sizeof(std::int16_t));
     } else if constexpr (SC_FX_LAZY) {   // FXZ: an empty column list = the copy, made on first read
         Context::FxPend& e = cx.fx_pend[cx.ply + 1];
+        e.kind = 1;
         e.na[0] = e.na[1] = e.ns[0] = e.ns[1] = 0;
+        e.rb_color = -1;
         cx.fx_ok[cx.ply + 1] = 0;
+        cx.ply++;
+        return;
     } else {
         std::memcpy(cx.stack_fx[cx.ply + 1].v[0], cx.stack_fx[cx.ply].v[0], hl * sizeof(std::int32_t));
         std::memcpy(cx.stack_fx[cx.ply + 1].v[1], cx.stack_fx[cx.ply].v[1], hl * sizeof(std::int32_t));
     }
     cx.bb[cx.ply + 1] = cx.bb[cx.ply];  // piece placement unchanged by a null move
     cx.ply++;
-#ifdef SC_LZSTAT
-    cx.lz_needed[cx.ply] = 0; ++g_lz_null;
-#endif
 }
 void acc_unmake_null(Context& cx) {
-#ifdef SC_LZSTAT
-    if (cx.ply > 0 && !cx.lz_needed[cx.ply]) ++g_lz_null_skip;
-#endif
     if (cx.ply > 0) cx.ply--;
 }
 
@@ -3321,7 +2368,5 @@ void acc_unmake() { acc_unmake(tl_context()); }
 void acc_clear() { acc_clear(tl_context()); }
 void acc_make_null() { acc_make_null(tl_context()); }
 void acc_unmake_null() { acc_unmake_null(tl_context()); }
-int acc_threats_made() noexcept { return acc_threats_made(tl_context()); }
-int acc_delta_l1() noexcept { return acc_delta_l1(tl_context()); }
 
 }  // namespace engine::nnue

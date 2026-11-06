@@ -61,14 +61,15 @@ using ContextPtr = std::unique_ptr<Context, ContextDeleter>;
 
 [[nodiscard]] Value evaluate(Context& c, const Board& board);
 [[nodiscard]] Value evaluate_pass(Context& c, const Board& board);
+void prefetch_eval(std::uint64_t key);   // the eval cache's slot for a child position
+void eval_cache_clear();                 // a new game or net: the next search starts with none
+void eval_cache_resize(int threads);     // the size per thread (SC_EVC_BITS); no search may be running
 void acc_reset(Context& c, const Board& board);
 void acc_make(Context& c, const Board& before, Move m);
 void acc_unmake(Context& c);
 void acc_clear(Context& c);
 void acc_make_null(Context& c);
 void acc_unmake_null(Context& c);
-[[nodiscard]] int acc_delta_l1(const Context& c) noexcept;
-[[nodiscard]] int acc_threats_made(const Context& c) noexcept;
 
 // -----------------------------------------------------------------------------
 // Incremental accumulator. The search maintains it around
@@ -98,16 +99,5 @@ void acc_clear();
 void acc_make_null();
 void acc_unmake_null();
 
-// L1 norm of the accumulator change made by the LAST acc_make(), summed over both
-// perspectives: "how much did this move change what the net sees". Valid only between
-// acc_make() and the matching acc_unmake(); returns 0 if the incremental stack is not in
-// sync or the float (labeler) net is loaded. Free of search state, so it is safe to call
-// from move-loop code. Raw sum, not normalised: the caller divides by a tuned constant.
-[[nodiscard]] int acc_delta_l1() noexcept;
-
-// Item #9: number of NEW attacks on a higher-valued enemy piece that the last acc_make()'s move
-// created, for the mover's side. Valid between acc_make() and its acc_unmake(); 0 on the king-cross
-// refresh path and for the float labeler net.
-[[nodiscard]] int acc_threats_made() noexcept;
 
 }  // namespace engine::nnue

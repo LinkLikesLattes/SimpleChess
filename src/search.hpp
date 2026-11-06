@@ -55,21 +55,10 @@
 #ifndef SC_DEFAULT_THREADS
 #define SC_DEFAULT_THREADS 8
 #endif
-// Pass-eval tension (dev-notes/NOVELTY_CANDIDATES.md #1; campaign record dev-notes/PASSEVAL.md).
-// 0 = no tension machinery at all, bit-for-bit the pre-campaign engine; 1 = the machinery compiled in
-// and the Pass* UCI tunables exposed. ON BY DEFAULT since 3.2.0 because it carries E6, the one plug
-// point kept: the correction-history update weighted by tension (PassCorrW 16, PassMinDepth 6, PassTau
-// 45, PassCap 1151 -- constants from the phase-controlled F1 diagnostic, +3.5 Elo [-1.7,+8.7] LOS 90.4%
-// over 6000 games at 10+0.1, deployed to lichess-bot 2026-09-11). Every OTHER tunable defaults to 0 and
-// is inert: those plug points were tested and stripped (see PASSEVAL.md), the code stays for the record.
-// SC_PASSEVAL_VERIFY adds the in-search oracle (dev builds only: every T is cross-checked against a real
-// null move).
-#ifndef SC_PASSEVAL
-#define SC_PASSEVAL 1
-#endif
-#ifndef SC_PASSEVAL_VERIFY
-#define SC_PASSEVAL_VERIFY 0
-#endif
+// Pass-eval tension (dev-notes/NOVELTY_CANDIDATES.md #1; campaign record dev-notes/PASSEVAL.md): the
+// correction-history update weighted by tension (PassCorrW 16, PassMinDepth 6, PassTau 45, PassCap 1151 --
+// constants from the phase-controlled F1 diagnostic, +3.5 Elo [-1.7,+8.7] LOS 90.4% over 6000 games at
+// 10+0.1, the 3.2.0 change). The other plug points were tested and dropped (3.7 removed their code).
 // The Pass* tunables are development knobs, not user options: they are never advertised in
 // the `uci` option list unless a tuning build sets SC_PASS_UCI_OPTIONS=1. setoption still
 // accepts them silently either way, so the match tooling can drive them (--set PassX=...).
@@ -87,113 +76,33 @@
 #ifndef SC_PASS_CAP
 #define SC_PASS_CAP 1151
 #endif
-#ifndef SC_PASS_RAZOR
-#define SC_PASS_RAZOR 0
-#endif
-#ifndef SC_PASS_RFP
-#define SC_PASS_RFP 0
-#endif
-#ifndef SC_PASS_LMRDIV
-#define SC_PASS_LMRDIV 0
-#endif
-#ifndef SC_PASS_NMPMARGIN
-#define SC_PASS_NMPMARGIN 0
-#endif
-#ifndef SC_PASS_ZUG
-#define SC_PASS_ZUG 0
-#endif
-#ifndef SC_PASS_QSLAMBDA
-#define SC_PASS_QSLAMBDA 0
-#endif
-#ifndef SC_PASS_TMSCALE
-#define SC_PASS_TMSCALE 0
-#endif
 #ifndef SC_PASS_CORRW
 #define SC_PASS_CORRW 16
 #endif
-// Item #8: per-move accumulator-delta significance into LMR. SC_ACCSIG compiles the plug in;
-// SC_ACCSIG_DIV 0 keeps it inert, so a candidate build with DIV 0 is identical to the control.
-#ifndef SC_ACCSIG
-#define SC_ACCSIG 0
-#endif
-#ifndef SC_ACCSIG_DIV
-#define SC_ACCSIG_DIV 0
-#endif
-#ifndef SC_ACCSIG_MAX
-#define SC_ACCSIG_MAX 2
-#endif
-// The opposite half of the same signal: reduce a quiet MORE when it barely changes what the net sees.
-// 0 = off. Cheaper by construction than SC_ACCSIG_DIV, because reducing more shrinks the tree where
-// reducing less grows it.
-#ifndef SC_ACCSIG_LOW
-#define SC_ACCSIG_LOW 0
-#endif
-// Minimum node depth at which the accsig plug fires (0 = every LMR node). The relief form's whole
-// problem is the tree it grows, and a depth gate cuts the number of firings far faster than it cuts
-// the effect -- the same trade that took E2-prime from +7.12% to -0.10% time-to-depth.
-#ifndef SC_ACCSIG_MINDEPTH
-#define SC_ACCSIG_MINDEPTH 0
-#endif
-// Item #9: plies of LMR relief for a quiet move that creates at least SC_THRSIG_MIN new attacks on a
-// higher-valued enemy piece. 0 = off.
-#ifndef SC_THRSIG
-#define SC_THRSIG 0
-#endif
-#ifndef SC_THRSIG_MIN
-#define SC_THRSIG_MIN 1
-#endif
-// 50-move-rule static-eval damping: scale the fresh static eval toward zero in proportion to the
-// halfmove clock, so a position shuffling toward the 50-move draw stops reporting a full advantage
-// it can no longer force. `eval -= eval * halfmove_clock / 199` (roughly halved at clock 100, the
-// draw threshold; 0 only at 199, which real play never reaches). Applied ONLY to a freshly computed
-// net eval, never to a value reused from the TT (that value was already damped when written -- damping
-// it again would double-damp on transpositions). Shipped on by default (+4 Elo [-2,+10], LOS 89% over
-// 1881 pairs at 10+0.1 -- a small, correctness-motivated gain); set to 0 to restore the old behaviour.
-#ifndef SC_R50DAMP
-#define SC_R50DAMP 1
-#endif
-// 50-move-rule mate reclassification: a mate score read back from the transposition table is only
-// real if the mating side can actually deliver it before the 50-move draw resets the game. When the
-// distance to mate from the probing node exceeds the plies the halfmove clock still allows
-// (100 - clock), the mate is unreachable, so downgrade it to a high but non-mate score
-// (VALUE_TB_WIN_IN_MAX_PLY - 1) -- the search keeps treating the position as winning but stops
-// trusting, extending, and reporting a forced mate it cannot force. Tablebase-band scores get the
-// same test against the distance to the zeroing position the probe was made at (the probe itself
-// is never cached, but the parents that back the score up are). Shipped on by default as a correctness fix:
-// SPRT was neutral at fast TC (+1 [-3,+5], LOS 69%, no regression over 3000 pairs) because the node
-// cost of surrendering false-mate cutoffs cancels the benefit there, but the engine no longer reports
-// or chases a mate the 50-move rule voids, and the payoff is a long-TC/endgame property the fast test
-// cannot see. Set to 0 to restore the plain ply de-shift.
-#ifndef SC_R50MATE
-#define SC_R50MATE 1
-#endif
-// 3.5 bug-hunt search fixes that change the tree in ordinary positions. Shipped on: no-regression
-// SPRT of the three together vs 3.4.0 (10+0.1, bounds [-3,+1]) PASSED, +11 Elo [+3,+19] over 943
-// pairs, LLR +2.98. Set one to 0 to restore the old behaviour.
-// SC_EVAL_SLOT (S6): razoring's qsearch and the singular verification search run on the node's
-//   own stack slot and overwrite static_eval; put the corrected value back afterwards.
-// SC_TREE_REP (S7, L1): a position that already occurred inside the search tree is a draw on its
-//   first recurrence (pre-root history still needs a threefold), and the scan stops at a null move.
-// SC_QS_PROMO (M1, movepick.hpp): qsearch also generates non-capturing queen promotions.
-#ifndef SC_EVAL_SLOT
-#define SC_EVAL_SLOT 1
-#endif
-#ifndef SC_TREE_REP
-#define SC_TREE_REP 1
-#endif
-// SC_R50KEY (3.6 fortress work, default 0 = 3.5 behaviour, node-identical): the TT key carries a
-// 50-move-clock bucket (clock < 14 -> 0, then one bucket per 8 plies), so stored scores and evals
-// are reused only near the clock they were computed at. Fortress at d31: -1593 frozen -> -1445.
-// SPRT vs 3.5.0 (10+0.1, [-3,+1]) stopped by hand at 2821 pairs: -0 Elo [-4,+4], LLR +0.76, no
-// verdict -- left off. See dev-notes/campaigns/fortress-3.6.
-#ifndef SC_R50KEY
-#define SC_R50KEY 0
-#endif
+// Search behaviours that were build switches until 3.7 (always on since they shipped):
+//  - 50-move damping (3.3): a freshly computed static eval is scaled toward zero by the halfmove clock,
+//    eval -= eval * clock / 199, never a TT-reused one (already damped). +4 Elo [-2,+10], LOS 89%.
+//  - 50-move mate reclassification (3.3): a TT mate or tablebase result whose distance from the probing
+//    node exceeds 100 - clock is unreachable and becomes a high non-mate score (tt_value_from).
+//  - 3.5 bug-hunt fixes (+11 Elo [+3,+19] together): razoring's qsearch and the singular verification
+//    search restore the node's corrected static eval (S6); a position repeated inside the tree is a draw
+//    on its first recurrence, pre-root history still needs a threefold, the scan stops at a null move
+//    (S7); qsearch also generates non-capturing queen promotions (M1, movepick.cpp).
 #include "types.hpp"
 
 namespace engine {
 
 class Search;
+
+// One long-lived search thread per worker, parked between searches (x86, and any build that asks for it);
+// otherwise a fresh thread per `go`.
+#ifndef SC_SEARCH_POOL
+#if defined(__ARM_NEON)
+#define SC_SEARCH_POOL 0
+#else
+#define SC_SEARCH_POOL 1
+#endif
+#endif
 
 // A search thread with a stack large enough for the deepest line (MAX_PLY plies of negamax and
 // qsearch frames, a few KB each). std::thread cannot set a stack size, and a secondary thread gets
@@ -251,7 +160,7 @@ void set_cp_norm(bool on);   // NormalizeScore: off = raw internal cp (tools tha
 // game generator (`gengame`) so its many per-ply searches don't spam stdout.
 void set_gen_silent(bool silent);
 
-// Pass-eval tunables (inert unless SC_PASSEVAL). set_pass_param returns false for an unknown
+// Pass-eval tunables (see kPassParams). set_pass_param returns false for an unknown
 // name (case-insensitive) and clamps to the tunable's range; pass_param_options prints the
 // `option name ...` lines only in SC_PASS_UCI_OPTIONS tuning builds (they are not user options).
 bool set_pass_param(std::string_view name, int value);
@@ -377,10 +286,8 @@ class Worker {
     int width_ = 0;
 
     // Pass-eval: per-iteration snapshot of the tunables (plain ints in the hot path, one
-    // consistent set per iteration, like width_), and the root's tension for the time manager
-    // (VALUE_NONE until the root node computed it; helpers keep their own copy).
-    std::array<int, 11> pass_{};
-    Value               root_tension_ = VALUE_NONE;
+    // consistent set per iteration, like width_).
+    std::array<int, 4> pass_{};
 
     // Triangular PV table: pv_[ply] holds the PV starting at that ply.
     std::array<std::array<Move, MAX_PLY + 1>, MAX_PLY + 1> pv_{};
