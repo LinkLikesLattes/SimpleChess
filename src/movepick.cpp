@@ -38,7 +38,7 @@ MovePicker::MovePicker(const Board& board, const History& hist, const OrderingCo
         // the horizon as much as a capture does. Only when a pawn stands on its 7th rank.
         const Color    us    = board.sideToMove();
         const Bitboard rank7 = Bitboard(us == Color::WHITE ? 0x00FF000000000000ULL : 0x000000000000FF00ULL);
-        if (SC_QS_PROMO && !(board.pieces(PieceType::PAWN, us) & rank7).empty()) {
+        if (!(board.pieces(PieceType::PAWN, us) & rank7).empty()) {
             Movelist quiet;
             chess::movegen::legalmoves<chess::movegen::MoveGenType::QUIET>(quiet, board,
                                                                          chess::PieceGenType::PAWN);
@@ -113,15 +113,9 @@ void MovePicker::score(const History& hist, const OrderingContext& ctx) {
 // picker is done; if the remaining non-quiets have pairwise distinct scores, take them by score
 // directly (their order cannot depend on where the quiets would have moved them); if two share a
 // score, keep the exact scan for the rest of the node. Same moves, same order -> bit-identical.
-#ifndef SC_NPS_M4
-#define SC_NPS_M4 1
-#endif
-
+//
 // NPS 3.6 item M1: the selection scan keeps the best score in a register instead of reloading
 // scores_[best] each step (a dependent load chain). Same comparisons, same pick -> bit-identical.
-#ifndef SC_NPS_M1
-#define SC_NPS_M1 1
-#endif
 
 // x86 M3x: the selection scan as an AVX2 max over the remaining scores, then the first index
 // holding that max (cmpeq + movemask + tzcnt) -- the same move the strict-greater scalar scan
@@ -135,7 +129,7 @@ void MovePicker::score(const History& hist, const OrderingContext& ctx) {
 #endif
 
 Move MovePicker::next(bool skip_quiets) {
-    if (SC_NPS_M4 && skip_quiets && skip_mode_ != 2) {
+    if (skip_quiets && skip_mode_ != 2) {
         auto non_quiet = [&](int i) {
             return board_.isCapture(moves_[i]) || moves_[i].typeOf() == Move::PROMOTION;
         };
@@ -179,13 +173,10 @@ Move MovePicker::next(bool skip_quiets) {
             }
         } else
 #endif
-        if constexpr (SC_NPS_M1) {
+        {
             int best_score = scores_[cur_];
             for (int j = cur_ + 1; j < moves_.size(); ++j)
                 if (scores_[j] > best_score) { best = j; best_score = scores_[j]; }
-        } else {
-            for (int j = cur_ + 1; j < moves_.size(); ++j)
-                if (scores_[j] > scores_[best]) best = j;
         }
         if (best != cur_) {
             std::swap(moves_[cur_], moves_[best]);

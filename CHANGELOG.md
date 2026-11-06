@@ -4,6 +4,54 @@ Release history for SimpleChess. An entry is added here whenever a tested candid
 
 <!-- new entries inserted below this line by `version.py promote` -->
 
+## v3.7.0 — 2026-11-05
+
+- Self-reports: `SimpleChess 3.7.0`
+- Source VERSION at save time: `3.7.0`
+
+### Strength
+
+Pentanomial SPRT at 10+0.1, one thread per engine, paired openings:
+
+| Comparison | Elo (95%) | Pairs |
+|---|---|---|
+| Network only: SCNNUEv3-2026-11-04 vs SCNNUEv3-2026-10-15, both on the 3.7.0 engine | +35 [+26, +45] | 668 |
+| Code + network: 3.7.0 vs the 3.6.0 release | +38 [+28, +48] | 621 |
+| 3.7.0 vs the 3.5.0 release | +111 [+93, +129] | 209 |
+
+3.5.0 is the reference point because it is the latest release with a CCRL rating: 3485 on CCRL 40/15
+(one CPU).
+
+### Speed
+
+The same search runs faster: about +5% nodes per second on Apple Silicon and +27% on x86-64 AVX2 at one
+thread (+39% at eight threads), measured on game replays. The node counts are unchanged, so the engine
+plays exactly as 3.6.0 would on the same network, only sooner.
+
+- Network evaluations are cached per search thread (16 MB per thread on Apple Silicon, 64 MB on x86-64,
+  in large pages on Windows when the system allows), so a position reached again by another move order
+  reuses its evaluation.
+- On x86-64 the int8 accumulator is updated lazily, only when a position is evaluated.
+
+### UCI
+
+- The win/draw/loss model behind `UCI_ShowWDL` and `NormalizeScore` is re-fitted for the new network on
+  1.05 billion positions from the engine's depth-7 self-play, scaled to the new network's scores. The raw
+  score at which a win is as likely as not is now about 6.6 pawns in bare endgames and 1.6 pawns with a
+  full board.
+
+### Code
+
+- Experimental code that was compiled out is removed and the network code is split into three files
+  (shared definitions, loading, inference); play is unchanged.
+
+### Network: SCNNUEv3-2026-11-04
+
+`nets/SCNNUEv3-2026-11-04.scn5` replaces `SCNNUEv3-2026-10-15`. Same architecture; the training set adds
+four generations of self-play, among them positions from a reverse analysis of the engine's own games,
+with the oldest positions dropped, for 4.29 billion positions in all. 79 superbatches of ~100M positions,
+eval/result blend 0.8 → 0.7.
+
 ## v3.6.0 — 2026-10-19
 
 - Self-reports: `SimpleChess 3.6.0`

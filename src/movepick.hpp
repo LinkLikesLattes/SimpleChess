@@ -19,11 +19,6 @@
 #include "history.hpp"
 #include "types.hpp"
 
-// M1 (3.5 bug hunt): qsearch also generates non-capturing queen promotions. Shipped on; see the
-// SC_EVAL_SLOT note in search.hpp for the game test. 0 restores the old behaviour.
-#ifndef SC_QS_PROMO
-#define SC_QS_PROMO 1
-#endif
 
 namespace engine {
 

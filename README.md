@@ -17,6 +17,7 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 | Version | CCRL Blitz 1CPU | CCRL Blitz 8CPU | CCRL 40/15 1CPU | CCRL 40/15 4CPU |
 |---|---|---|---|---|
+| 3.7.0 | Not yet tested | Not yet tested | Not yet tested | Not yet tested |
 | 3.6.0 | Not yet tested | Not yet tested | Not yet tested | Not yet tested |
 | 3.5.0 | **3561** (±16, #84, 959 games) | Not yet tested | **3485** (±18, #88, 556 games) | Not yet tested |
 | 3.4 or earlier | Never tested | Never tested | Never tested | Never tested |
@@ -57,7 +58,7 @@ make clean
 For the fastest (shipping) binary, use the profile-guided build:
 
 ```sh
-make profile-build PGO_NET=nets/SCNNUEv3-2026-10-15.scn5
+make profile-build PGO_NET=nets/SCNNUEv3-2026-11-04.scn5
 ```
 
 The release build uses `-O3 -flto -mcpu=native`; retarget the architecture with,
@@ -67,7 +68,7 @@ any AVX2 machine (Haswell or newer) use `make ARCH="-march=x86-64-v3"`.
 `profile-build` additionally needs Python 3 with
 [python-chess](https://pypi.org/project/chess/) (`pip install chess`) for its
 training workload. A `CMakeLists.txt` is provided for IDE / CMake users.
-`make EMBED_NET=nets/SCNNUEv3-2026-10-15.scn5` bakes the network into the executable
+`make EMBED_NET=nets/SCNNUEv3-2026-11-04.scn5` bakes the network into the executable
 for a single-file deployment; a newer net beside the binary still takes precedence.
 
 **Android (arm64).** The repository's GitHub Actions workflow
@@ -119,22 +120,22 @@ Point the `EvalFile` option at another file to use a different network.
 
 **Score and win/draw/loss.** The reported `cp` is normalized by default: 100 cp means the side to move
 wins half the time at the material on the board. The raw search score at which that happens falls from
-about 5.8 pawns in bare endgames to 1.5 pawns with a full board, so normalized scores read smaller than
+about 6.6 pawns in bare endgames to 1.6 pawns with a full board, so normalized scores read smaller than
 raw ones, the more so with less material; set `NormalizeScore` to false for the raw score. With
 `UCI_ShowWDL` on, each scored `info` line also carries the side to move's chances in per mille, e.g.
 `score cp 36 wdl 335 477 188`. Both come from a logistic model in the raw score whose centre and width
-depend on the material, fitted on the engine's own depth-9 self-play with the shipped network, so with
+depend on the material, fitted on the engine's own self-play for the shipped network, so with
 another `EvalFile` the numbers are not calibrated. Mates and tablebase results read `1000 0 0` /
 `0 0 1000` and keep their usual score.
 
 ## The network
 
-`nets/SCNNUEv3-2026-10-15.scn5` is the pre-quantized int8 playing network (file
+`nets/SCNNUEv3-2026-11-04.scn5` is the pre-quantized int8 playing network (file
 magic `SCN5`), committed to the repo so the engine works immediately after a
 clone or "Download ZIP." Nets are named `SCNNUEv<MAJOR>-<YYYY-MM-DD>.scn5`
 (engine major + export date) and the engine loads the newest one it finds; the
 repo always ships only the latest network — older nets are available from older
-releases. It is trained on 3.18 billion positions from the engine's own self-play;
+releases. It is trained on 4.29 billion positions from the engine's own self-play;
 the trainer and training data are developed separately and are not part of this
 repository.
 
