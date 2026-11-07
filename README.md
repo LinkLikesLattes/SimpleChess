@@ -22,7 +22,7 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 | 3.5.0 | **3562** (±16, #84, 959 games) | N/A | **3485** (±18, #88, 560 games) | N/A |
 | 3.4 or earlier | N/A | N/A | N/A | N/A |
 
-<sub>CCRL ratings as of 2026-10-31.</sub>
+<sub>CCRL ratings as of 2026-11-07.</sub>
 
 ## Features
 
