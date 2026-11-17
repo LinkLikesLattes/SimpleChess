@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 830" width="1440" height="830"
+     font-family="'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img"
+     aria-label="The SimpleChess network: king-bucketed HalfKA, threat and pawn-pair inputs (72,048 per side) feed one 512-wide accumulator per side with shared int8 weights; clipped ReLU and a pairwise product give 256 per side, concatenated to 512; one of eight layer stacks, picked by piece count, maps 512 to 32 to 32 to 1 with squared clipped ReLU; the evaluation is 400 times the output">
+  <title>The SimpleChess network (SCN5, HL 512)</title>
+  <defs>
+    <style>
+      text       { fill: #E9ECEF; }
+      .dim       { fill: #9AA3AD; }
+      .red       { fill: #E8564D; }
+      .mono      { font-family: 'SF Mono', Menlo, Consolas, 'Cascadia Mono', monospace; }
+      .sec       { font-size: 12px; letter-spacing: .14em; fill: #8C96A2; font-weight: 600; }
+      .box       { fill: #181C21; stroke: #2A3038; }
+      .steel     { fill: #1C2128; stroke: #5A6470; }
+      .layer     { fill: #4A1719; stroke: #C9302C; }
+      .arrow     { stroke: #5C6673; stroke-width: 1.6; fill: none; }
+      .arrow-r   { stroke: #C9302C; stroke-width: 1.6; fill: none; stroke-dasharray: 5 4; }
+      .cell      { stroke: #0D0F12; stroke-width: 2; }
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5C6673"/>
+    </marker>
+    <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#C9302C"/>
+    </marker>
+  </defs>
+
+  <rect width="1440" height="830" fill="#0D0F12"/>
+
+  <text x="40" y="52" font-size="26" font-weight="600">The SimpleChess network · SCN5, HL 512</text>
+  <text x="40" y="80" font-size="14.5" class="dim">Three sparse feature sets feed one 512-wide accumulator per side; the pairwise product of its clipped halves feeds one of eight layer stacks, picked by piece count.</text>
+
+  <!-- section headers -->
+  <text x="40"   y="128" class="sec">1 · INPUTS (FOR EACH SIDE) · <tspan class="mono">72,048</tspan></text>
+  <text x="480"  y="128" class="sec">2 · FEATURE TRANSFORMER</text>
+  <text x="740"  y="128" class="sec">3 · ACTIVATION</text>
+  <text x="1088" y="128" class="sec">4 · LAYER STACK (1 OF 8)</text>
+
+  <!-- ===== 1 · inputs ===== -->
+  <rect x="40" y="146" width="390" height="270" rx="10" class="steel"/>
+  <text x="64" y="178" font-size="17" font-weight="600">HalfKA <tspan font-size="14" font-weight="400" class="dim">· king × piece × square</tspan></text>
+  <text x="406" y="178" font-size="16" text-anchor="end" class="mono">7,680</text>
+  <text x="64" y="202" font-size="13" class="dim">12 piece types × 64 squares, in one of 10 king buckets</text>
+
+  <!-- king-bucket board: own side's view, files a-d after mirroring, rank 8 at the top; one block per bucket -->
+  <g font-size="10" class="mono" text-anchor="middle">
+    <rect x="89"  y="223" width="86" height="40" rx="2" fill="#2B323C"/><text x="132" y="247">9</text>
+    <rect x="89"  y="265" width="86" height="40" rx="2" fill="#353D48"/><text x="132" y="289">8</text>
+    <rect x="89"  y="307" width="86" height="19" rx="2" fill="#414A56"/><text x="132" y="320">7</text>
+    <rect x="89"  y="328" width="86" height="19" rx="2" fill="#4D5764"/><text x="132" y="341">6</text>
+    <rect x="89"  y="349" width="42" height="19" rx="2" fill="#5B6573"/><text x="110" y="362">4</text>
+    <rect x="133" y="349" width="42" height="19" rx="2" fill="#687382"/><text x="154" y="362">5</text>
+    <rect x="89"  y="370" width="20" height="19" rx="2" fill="#8E2A26"/><text x="99"  y="383">0</text>
+    <rect x="111" y="370" width="20" height="19" rx="2" fill="#A3302B"/><text x="121" y="383">1</text>
+    <rect x="133" y="370" width="20" height="19" rx="2" fill="#B83630"/><text x="143" y="383">2</text>
+    <rect x="155" y="370" width="20" height="19" rx="2" fill="#C9302C"/><text x="165" y="383">3</text>
+  </g>
+  <g font-size="10" class="dim mono" text-anchor="middle">
+    <text x="99" y="404">a</text><text x="121" y="404">b</text><text x="143" y="404">c</text><text x="165" y="404">d</text>
+  </g>
+  <g font-size="10" class="dim mono" text-anchor="end">
+    <text x="82" y="236">8</text><text x="82" y="383">1</text>
+  </g>
+  <text x="200" y="240" font-size="14" font-weight="600">king buckets</text>
+  <text x="200" y="262" font-size="13" class="dim">the side's own king square picks one</text>
+  <text x="200" y="280" font-size="13" class="dim">of 10 weight sets: one per square on</text>
+  <text x="200" y="298" font-size="13" class="dim">the back rank, wider zones further up</text>
+  <text x="200" y="330" font-size="14" font-weight="600">mirrored</text>
+  <text x="200" y="352" font-size="13" class="dim">a king on files e–h sees the board</text>
+  <text x="200" y="370" font-size="13" class="dim">flipped left to right, so only files</text>
+  <text x="200" y="388" font-size="13" class="dim">a–d need weights</text>
+
+  <rect x="40" y="432" width="390" height="64" rx="10" class="box"/>
+  <text x="64" y="470" font-size="17" font-weight="600">Threats <tspan font-size="14" font-weight="400" class="dim">· piece attacks piece</tspan></text>
+  <text x="406" y="470" font-size="16" text-anchor="end" class="mono">59,808</text>
+
+  <rect x="40" y="510" width="390" height="64" rx="10" class="box"/>
+  <text x="64" y="548" font-size="17" font-weight="600">PawnPairs <tspan font-size="14" font-weight="400" class="dim">· same or adjacent files</tspan></text>
+  <text x="406" y="548" font-size="16" text-anchor="end" class="mono">4,560</text>
+
+  <text x="40" y="606" font-size="13" class="dim">Sparse inputs: one HalfKA feature per piece, one threat</text>
+  <text x="40" y="624" font-size="13" class="dim">feature per attack, one pawn-pair feature per pair of pawns</text>
+  <text x="40" y="642" font-size="13" class="dim">within a file of each other. All three share one transformer.</text>
+
+  <!-- inputs -> accumulators -->
+  <path d="M430,281 H448 M430,464 H448 M430,542 H448 M448,260 V542" class="arrow"/>
+  <path d="M448,260 H476" class="arrow" marker-end="url(#a)"/>
+  <path d="M448,400 H476" class="arrow" marker-end="url(#a)"/>
+
+  <!-- ===== 2 · feature transformer ===== -->
+  <text x="480" y="156" font-size="13.5" class="dim">computed twice, from each side's point of view</text>
+  <text x="480" y="176" font-size="13.5" class="dim">(inputs relative to that side's king), same weights</text>
+
+  <rect x="480" y="200" width="220" height="120" rx="10" class="box"/>
+  <text x="590" y="228" font-size="13.5" text-anchor="middle" class="dim">accumulator · side to move</text>
+  <text x="590" y="270" font-size="32" font-weight="700" text-anchor="middle">512</text>
+  <text x="590" y="300" font-size="13" text-anchor="middle" class="dim">int8 weights · int16 sums</text>
+
+  <rect x="480" y="340" width="220" height="120" rx="10" class="box"/>
+  <text x="590" y="368" font-size="13.5" text-anchor="middle" class="dim">accumulator · opponent</text>
+  <text x="590" y="410" font-size="32" font-weight="700" text-anchor="middle">512</text>
+  <text x="590" y="440" font-size="13" text-anchor="middle" class="dim">int8 weights · int16 sums</text>
+
+  <text x="480" y="492" font-size="13" class="dim">updated incrementally: a move adds</text>
+  <text x="480" y="510" font-size="13" class="dim">and subtracts only the rows of the</text>
+  <text x="480" y="528" font-size="13" class="dim">features it changed; a king entering</text>
+  <text x="480" y="546" font-size="13" class="dim">a new bucket refills from a cache</text>
+  <text x="480" y="564" font-size="13" class="dim">kept per bucket</text>
+
+  <!-- accumulators -> activation -->
+  <path d="M700,260 L736,260" class="arrow" marker-end="url(#a)"/>
+  <path d="M700,400 L736,400" class="arrow" marker-end="url(#a)"/>
+
+  <!-- ===== 3 · activation ===== -->
+  <rect x="740" y="210" width="160" height="100" rx="10" class="box"/>
+  <text x="820" y="238" font-size="13.5" text-anchor="middle" class="dim">clipped ReLU,</text>
+  <text x="820" y="257" font-size="13.5" text-anchor="middle" class="dim">pairwise product</text>
+  <text x="820" y="290" font-size="20" text-anchor="middle" class="mono">512 → 256</text>
+
+  <rect x="740" y="350" width="160" height="100" rx="10" class="box"/>
+  <text x="820" y="378" font-size="13.5" text-anchor="middle" class="dim">clipped ReLU,</text>
+  <text x="820" y="397" font-size="13.5" text-anchor="middle" class="dim">pairwise product</text>
+  <text x="820" y="430" font-size="20" text-anchor="middle" class="mono">512 → 256</text>
+
+  <text x="740" y="482" font-size="13" class="dim">each half of 256 times the other:</text>
+  <text x="740" y="500" font-size="13" class="dim">a[i] · a[i + 256], both clipped</text>
+  <text x="740" y="518" font-size="13" class="dim">to [0, 1] first</text>
+
+  <!-- activation -> concat -->
+  <path d="M900,260 H922 M900,400 H922 M922,260 V400" class="arrow"/>
+  <path d="M922,330 H944" class="arrow" marker-end="url(#a)"/>
+  <rect x="948" y="308" width="108" height="44" rx="22" class="box"/>
+  <text x="1002" y="336" font-size="16" text-anchor="middle" class="mono">concat 512</text>
+  <text x="1002" y="372" font-size="12" text-anchor="middle" class="dim">side to move first</text>
+
+  <!-- concat -> L1 -->
+  <path d="M1056,330 H1070 V218 H1104" class="arrow" marker-end="url(#a)"/>
+
+  <!-- ===== 4 · layer stack ===== -->
+  <rect x="1088" y="146" width="320" height="438" rx="10" fill="none" stroke="#C9302C" stroke-dasharray="6 5"/>
+  <text x="1248" y="176" font-size="15" font-weight="600" text-anchor="middle" class="red">bucket = (pieces − 2) / 4</text>
+
+  <rect x="1108" y="192" width="280" height="52" rx="8" class="layer"/>
+  <text x="1126" y="224" font-size="16" font-weight="600">L1 · int8 affine</text>
+  <text x="1370" y="224" font-size="17" text-anchor="end" class="mono">512 → 32</text>
+  <path d="M1248,244 L1248,258" class="arrow" marker-end="url(#a)"/>
+
+  <rect x="1108" y="262" width="280" height="44" rx="8" class="box"/>
+  <text x="1248" y="289" font-size="14.5" text-anchor="middle">squared clipped ReLU · <tspan class="mono">32</tspan></text>
+  <path d="M1248,306 L1248,320" class="arrow" marker-end="url(#a)"/>
+
+  <rect x="1108" y="324" width="280" height="52" rx="8" class="layer"/>
+  <text x="1126" y="356" font-size="16" font-weight="600">L2 · affine</text>
+  <text x="1370" y="356" font-size="17" text-anchor="end" class="mono">32 → 32</text>
+  <path d="M1248,376 L1248,390" class="arrow" marker-end="url(#a)"/>
+
+  <rect x="1108" y="394" width="280" height="44" rx="8" class="box"/>
+  <text x="1248" y="421" font-size="14.5" text-anchor="middle">squared clipped ReLU · <tspan class="mono">32</tspan></text>
+  <path d="M1248,438 L1248,452" class="arrow" marker-end="url(#a)"/>
+
+  <rect x="1108" y="456" width="280" height="52" rx="8" class="layer"/>
+  <text x="1126" y="488" font-size="16" font-weight="600">L3 · affine</text>
+  <text x="1370" y="488" font-size="17" text-anchor="end" class="mono">32 → 1</text>
+
+  <text x="1248" y="540" font-size="13" text-anchor="middle" class="dim">8 such stacks, one per 4 pieces:</text>
+  <text x="1248" y="560" font-size="13" text-anchor="middle" class="dim mono">2–5, 6–9, … 26–29, 30–32</text>
+
+  <!-- piece count -> stack -->
+  <rect x="780" y="540" width="140" height="44" rx="22" fill="#24110F" stroke="#C9302C"/>
+  <text x="850" y="568" font-size="16" font-weight="600" text-anchor="middle" class="red">piece count</text>
+  <path d="M920,562 L1084,562" class="arrow-r" marker-end="url(#r)"/>
+  <text x="1002" y="586" font-size="12.5" text-anchor="middle" class="dim">picks the stack</text>
+
+  <!-- ===== 5 · output ===== -->
+  <text x="1088" y="628" class="sec">5 · OUTPUT</text>
+  <path d="M1248,584 V650" class="arrow" marker-end="url(#a)"/>
+  <rect x="1088" y="654" width="320" height="76" rx="10" fill="#24110F" stroke="#C9302C"/>
+  <text x="1112" y="686" font-size="17" font-weight="600">evaluation = 400 × output</text>
+  <text x="1112" y="712" font-size="13.5" class="dim">centipawns, from the side to move's view</text>
+
+  <!-- footer -->
+  <text x="40" y="776" font-size="14" class="dim">Weights: 36.9 million in the feature transformer (72,048 × 512, int8, shared by both sides) and 140 thousand in the eight layer stacks (L1 int8, L2 and L3 float).</text>
+  <text x="40" y="800" font-size="14" class="dim">The playing file (SCN5) is 37 MB. Its float twin (SCN4) labels new self-play data; nets are trained with bullet against a blend of game results and search scores.</text>
+</svg>

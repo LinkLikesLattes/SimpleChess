@@ -24,11 +24,16 @@ x86-64 (AVX2), and builds and runs anywhere with a C++20 compiler.
 
 <sub>CCRL ratings as of 2026-11-14.</sub>
 
+## Evaluation
+
+A custom NNUE: a HalfKAv2_hm input (king-bucketed and mirrored) extended with
+threat and pawn-pair features, a 512-wide accumulator, and int8 SIMD inference
+(NEON on Apple Silicon, AVX2 on x86-64).
+
+<p align="center"><img src="assets/nnue-architecture.svg" alt="The SimpleChess network: king-bucketed HalfKA, threat and pawn-pair inputs (72,048 per side) feed one 512-wide accumulator per side with shared int8 weights; clipped ReLU and a pairwise product give 256 per side, concatenated to 512; one of eight layer stacks, picked by piece count, maps 512 to 32 to 32 to 1 with squared clipped ReLU; the evaluation is 400 times the output" width="100%"></p>
+
 ## Features
 
-- **Evaluation** — a custom NNUE: a HalfKAv2_hm input (king-bucketed and
-  mirrored) extended with threat and pawn-pair features, a 512-wide accumulator,
-  and int8 SIMD inference (NEON on Apple Silicon, AVX2 on x86-64).
 - **Endgame tablebases** — Syzygy WDL probing (via Fathom): point `SyzygyPath` at
   your 3-4-5 or 6-man tables.
 - **Search** — iterative-deepening alpha-beta with aspiration windows, null-move

@@ -11,6 +11,7 @@ covered from one place:
 | `simplechess-100x50.bmp` | The classic engine-logo convention: 100×50, 24-bit BMP. Arena picks these up, and ChessBase/Fritz auto-load one placed **next to the engine binary and named exactly like it** (i.e. copy it to `simplechess.bmp` beside `simplechess.exe`). |
 | `simplechess-130x65.bmp` | The same logo at 130×65 — the larger BMP size some GUIs and engine listings use. |
 | `simplechess.ico` | Multi-resolution Windows icon (16–256 px) for the executable and shortcuts on Windows builds. |
+| `nnue-architecture.svg` | Diagram of the network (SCN5, HL 512): inputs, feature transformer, activation, the eight layer stacks and the output. |
 
 The BMPs are pre-sized rather than scaled at load because the GUIs that want
 them do no scaling of their own — a wrong-sized logo is simply not shown.
