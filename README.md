@@ -30,6 +30,8 @@ A custom NNUE: a HalfKAv2_hm input (king-bucketed and mirrored) extended with
 threat and pawn-pair features, a 512-wide accumulator, and int8 SIMD inference
 (NEON on Apple Silicon, AVX2 on x86-64).
 
+SimpleChess's first-gen network was trained on SimpleChess's HCE labels and game results. The HCE evaluated exclusively using code-written versions of human chess principles (e.g., outposts, passed pawns, bishop pair, etc.), matching the "simple chess" approach. Every subsequent generation blended HCE scores and NNUE scores until the NNUE surpassed the HCE in evaluation quality (tested via fixed-depth games). SimpleChess's NNUE is on generation 33 as of 3.7. Compared to the final HCE version of SimpleChess, 3.7 performs at roughly +800 elo. SimpleChess has never used and will never use outside labels during training. All improvements in NNUE performance come from SimpleChess's in-dev reinforcement learning.
+
 <p align="center"><img src="assets/nnue-architecture.svg" alt="The SimpleChess network: king-bucketed HalfKA, threat and pawn-pair inputs (72,048 per side) feed one 512-wide accumulator per side with shared int8 weights; clipped ReLU and a pairwise product give 256 per side, concatenated to 512; one of eight layer stacks, picked by piece count, maps 512 to 32 to 32 to 1 with squared clipped ReLU; the evaluation is 400 times the output" width="100%"></p>
 
 ## Features
